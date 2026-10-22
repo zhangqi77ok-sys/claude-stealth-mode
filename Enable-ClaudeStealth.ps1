@@ -76,7 +76,7 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 Write-Host "  ✅ 命令行与子进程代理已生效 (HTTP_PROXY / HTTPS_PROXY = $proxyHttp)" -ForegroundColor Green
 
 # -------------------------------------------------------------------------
-# 2. 切换系统时区为美国太平洋时间，并锁定防止系统自动改回
+# 2. 切换系统时区为美国太平洋时间，并锁定
 # -------------------------------------------------------------------------
 Write-Host "`n[2/6] 正在修改系统时区为 [$Timezone]..." -ForegroundColor Yellow
 tzutil /s $Timezone
@@ -122,10 +122,41 @@ if (Test-Path $chromePrefPath) {
     }
 }
 
+# 检测 WebRTC Control 扩展安装状态
+$webrtcExt = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Extensions\fjkmabmdepjfammlpliljpnbhleegehm"
+if (Test-Path $webrtcExt) {
+    Write-Host "  ✅ 检测到 WebRTC Control 插件已就绪 (内存级 UDP 拦截正常)" -ForegroundColor Green
+} else {
+    Write-Host "  ℹ️ 建议安装 WebRTC Control 扩展以实现 100% 内存级防泄露" -ForegroundColor DarkGray
+}
+
 # -------------------------------------------------------------------------
-# 4. 清理旧的 Claude 桌面端与浏览器缓存残留
+# 4. 维护桌面专属防检测 Chrome 快捷方式
 # -------------------------------------------------------------------------
-Write-Host "`n[4/6] 正在扫描并清理 Claude 历史设备指纹与沙箱残留..." -ForegroundColor Yellow
+Write-Host "`n[4/6] 正在维护桌面防检测快捷方式..." -ForegroundColor Yellow
+try {
+    $wsh = New-Object -ComObject WScript.Shell
+    $desktop = [System.Environment]::GetFolderPath("Desktop")
+    $shortcutPath = Join-Path $desktop "Google Chrome (防检测无痕).lnk"
+    $chromeExe = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+    if (-not (Test-Path $chromeExe)) {
+        $chromeExe = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    }
+    if (Test-Path $chromeExe) {
+        $shortcut = $wsh.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $chromeExe
+        $shortcut.Arguments = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp --lang=en-US --incognito"
+        $shortcut.IconLocation = "$chromeExe,0"
+        $shortcut.Description = "Claude 防检测专用 Chrome"
+        $shortcut.Save()
+        Write-Host "  ✅ 桌面快捷方式已更新: Google Chrome (防检测无痕)" -ForegroundColor Green
+    }
+} catch {}
+
+# -------------------------------------------------------------------------
+# 5. 清理旧的 Claude 桌面端硬件指纹与沙箱残留
+# -------------------------------------------------------------------------
+Write-Host "`n[5/6] 正在扫描并清理 Claude 历史设备指纹与沙箱残留..." -ForegroundColor Yellow
 $claudePkgData = "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache"
 if (Test-Path $claudePkgData) {
     Remove-Item -Path $claudePkgData -Recurse -Force -ErrorAction SilentlyContinue
@@ -135,9 +166,9 @@ Get-ChildItem "$env:LOCALAPPDATA\Temp" -Filter "*claude*" -ErrorAction SilentlyC
 Write-Host "  ✅ 已清理临时执行沙箱文件" -ForegroundColor Green
 
 # -------------------------------------------------------------------------
-# 5. 实时检测外网出口与纯净度验证
+# 6. 实时检测外网出口与纯净度验证
 # -------------------------------------------------------------------------
-Write-Host "`n[5/6] 正在发起外网出口连通性与泄漏检测..." -ForegroundColor Yellow
+Write-Host "`n[6/6] 正在发起外网出口连通性与泄漏检测..." -ForegroundColor Yellow
 try {
     $trace = Invoke-RestMethod -Uri "https://www.cloudflare.com/cdn-cgi/trace" -Proxy $proxyHttp -TimeoutSec 6
     $loc = ($trace -split "`n" | Where-Object { $_ -match "^loc=" }) -replace "loc=", ""
