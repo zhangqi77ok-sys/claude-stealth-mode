@@ -1,129 +1,74 @@
-# Agent Learning Path
+# Claude Stealth Mode (Claude 免 TUN 终极防封隐身工具)
 
-面向有 **Java 后端**背景、转向 **AI Agent / Agent 应用工程** 的实战仓库。
+🚀 **专为 Windows 平台打造的 Claude / Claude Desktop 防区域检测与防封号隐身脚本。**
 
-这里不教怎么写 Prompt。它记录的是另一件事：一个 Agent 系统上线之前，**控制面**必须具备哪些能力，以及如何用可运行的代码把它们证明出来。
-
-每个模块都遵循同一条证据链：**先注入故障，再拿 Trace / Eval 证明它不会再犯。**
+无需开启虚拟网卡（TUN 模式），彻底解决 Claude 网页端与桌面端（特别是写代码/调用本地终端时）因为真实 IP 泄漏、WebRTC 穿透、时区语言冲突导致的频繁封号与区域拦截（*“App unavailable in your region”*）。
 
 ---
 
-## 快速验证
+## 🌟 核心痛点与解决机制
 
-**不需要 API Key，不需要装任何依赖**（模块内部使用进程内 mock）。
-
-```bash
-git clone https://github.com/zhangqi77ok-sys/agent-learning-path.git
-cd agent-learning-path
-
-# 主作品：五段演示一跑到底，最后打印 ALL_OK
-python 03-modules/A9-capstone/demo.py
-```
-
-一次跑完全部 11 个零依赖模块：
-
-```bash
-for m in 03-modules/*/ 04-frontier/B2-a2a/ projects/hotplug-harness/; do
-  (cd "$m" && python demo.py | tail -1)
-done
-```
-
-`02-applications/` 与 `04-frontier/B1-durable-runtime/` 需要额外依赖（见下方[环境](#环境)）。
+| 泄漏与封号风险点 | 普通代理（未开 TUN）的表现 | 本工具解决方案 |
+| :--- | :--- | :--- |
+| **桌面端代码子进程** | Claude 桌面端执行本地命令（PowerShell/Git/Node/Python）时**直接绕过代理裸连国内真实 IP** | 自动向系统注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 及 Git 代理，强制所有命令行程序走代理 |
+| **WebRTC 穿透** | 浏览器 WebRTC 绕过 WinINet 代理，通过物理网卡向 STUN 发 UDP，直接暴露国内真实 IP | 注入 Chrome 策略 `disable_non_proxied_udp`，彻底锁死 WebRTC 旁路泄露 |
+| **时区与指纹矛盾** | 节点在美国，系统时区却是 `Asia/Shanghai`（差 15~16 小时），前端 JS 秒抓 | 自动切换系统时区为 **美国太平洋时间 (`Pacific Standard Time`)** 并锁定 |
+| **语言暴露** | 浏览器默认发送 `Accept-Language: zh-CN` | 自动将 Chrome 首选语言切换为 `en-US,en` |
+| **设备硬件指纹关联** | Claude 桌面端在本地写入 `ant-did` 与旧账号终身绑定，换号直接连环封 | 自动扫描并抹除 `ant-did`、`ant-device-registry.json` 及沙箱临时文件，恢复全新设备状态 |
 
 ---
 
-## 模块地图
+## 📁 仓库结构
 
-主线 A1–A9 是一条递进链：从单个 Run 的控制，到长任务、多租户、评测门禁，最后收束到 Capstone。
-
-| 模块 | 主题 | 关键控制点 | 故障注入证据 |
-|------|------|-----------|-------------|
-| [A1](03-modules/A1-runtime/) | Runtime / Harness | Loop、工具白名单、预算、熔断、Replay | 死循环熔断 → `circuit_open`；越权工具拦截；预算耗尽停机 |
-| [A2](03-modules/A2-long-task/) | 长任务一致性 | Checkpoint / Ledger / Outbox / Lease | 重复 resume → 外部副作用只发生 1 次 |
-| [A3](03-modules/A3-tenant-auth/) | 租户 / RBAC / 审批 | 四键隔离、网关下发身份、HITL | 跨租户读 0 行；伪造 header 被拒；审批留审计 |
-| [A4](03-modules/A4-advanced-rag/) | 进阶 RAG | 混合检索、版本过期、检索前 ACL | 过期文档不进上下文；跨租户不串答 |
-| [A5](03-modules/A5-mcp-registry/) | MCP / Registry / 沙箱 | 工具指纹、版本治理、沙箱策略 | 工具变更可追溯；越界调用被沙箱挡下 |
-| [A6](03-modules/A6-eval-otel/) | Eval + OTEL + 门禁 | 四层评测、发布红线、holdout | 失败 Trace 回放进回归集；残缺 fixture 禁入库 |
-| [A7](03-modules/A7-model-gateway/) | 模型网关 | 按租户路由、预算、429 降级、缓存键 | 路由决策进 Trace；超预算可拒绝 |
-| [A8](03-modules/A8-ha-platform/) | 高可用平台 | 队列、无状态 Runtime、隔离池、背压 | 双 Worker 争抢同一任务只成功一次 |
-| [A9](03-modules/A9-capstone/) | **Capstone 主作品** | 端到端控制面 | 五段演示（见下） |
-
-前沿对照：
-
-| 模块 | 主题 | 说明 |
-|------|------|------|
-| [B1](04-frontier/B1-durable-runtime/) | Durable Runtime（Temporal） | Workflow / Activity / Signal 分工；Activity 幂等。**需装 `temporalio`** |
-| [B2](04-frontier/B2-a2a/) | 最小 A2A | Agent 间委托：下行身份、幂等键、超时与取消 |
-
-设计取舍与对照关系见 [`docs/curriculum.md`](docs/curriculum.md)，能力维度拆解见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，20大核心痛难点深度攻坚见 [`docs/production-agent-20-deep-dive.md`](docs/production-agent-20-deep-dive.md)。
-
----
-
-## 主作品：A9 Capstone
-
-多租户企业 Agent 控制面，完整链路：**Java 鉴权 → Python Harness → 检索/工具/HITL → Outbox → Trace → Eval**。
-
-`python 03-modules/A9-capstone/demo.py` 输出五段：
-
-| 段 | 演示内容 | 判定 |
-|----|---------|------|
-| (a) | 四隔离键 + 跨租户访问 | `cross_tenant_rows = 0` |
-| (b) | 已批准副作用的幂等 + Outbox | 重复 resume，`create_calls = 1` |
-| (c) | 检索 ACL | 两个租户拿到各自答案，不串 |
-| (d) | Loop 预算与熔断 | `circuit_open` / `budget_exhausted` |
-| (e) | Trace → Bad Case → Eval 回放 | 脱敏 fixture；残缺样本禁入库 |
-
-另有端到端可插拔项目 [`projects/hotplug-harness/`](projects/hotplug-harness/)：工具 / 模型 / 策略从 `plugins/` 热加载，不改核心循环即可扩展，附带 FastAPI + Vite 的 Q&A 控制台。
-
----
-
-## 目录结构
-
-```
-01-foundations/     单概念最小实现：流式、记忆、工具调用、Agent Loop、
-                    RAG 演进、状态图、Multi-Agent、MCP、评测
-02-applications/    第一个能跑起来的服务：API 封装、工具循环、RAG 服务、
-                    LangGraph + HITL（需 openai / fastapi / langgraph）
-03-modules/         主线 A1–A9：生产级控制面模块（零依赖可跑）
-04-frontier/        B1 Temporal、B2 A2A：与主流框架的对照实现
-projects/           端到端作品（hotplug-harness）
-docs/               课纲、能力矩阵、架构与 Java→Agent 迁移笔记
-docs/prep/          备考材料：面试记录、JD 调研、简历要点、团队进度
+```text
+├── Enable-ClaudeStealth.ps1    # 【一键开启】防检测隐身模式（用 Claude 前运行）
+├── Disable-ClaudeStealth.ps1   # 【一键还原】恢复中国标准时间与默认系统设置
+├── LICENSE                     # 开源许可证 (MIT)
+└── README.md                   # 项目说明文档
 ```
 
 ---
 
-## 环境
+## 🚀 快速使用
 
-零依赖模块（A1–A9、B2、hotplug-harness）用系统 Python 即可跑。
+### 1. 开启隐身模式
 
-需要联网或真实模型的部分：
+打开 PowerShell（或右键脚本选择“使用 PowerShell 运行”）：
 
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt    # openai / fastapi / mcp / langgraph
-cp .env.example .env               # 填入中转站 Key 与 Base URL
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Enable-ClaudeStealth.ps1
 ```
 
-B1 额外需要：
+*默认代理端口为 `7897`（Clash Verge 默认混合端口）。如果您使用其他端口，可通过参数指定：*
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Enable-ClaudeStealth.ps1 -ProxyPort 7890
+```
 
-```bash
-pip install temporalio
+运行后控制台会自动完成：
+1. 注入 CLI 代理环境变量与 Git 代理；
+2. 切换并锁定系统时区为美国太平洋时间；
+3. 配置 Chrome 禁用 WebRTC 泄漏并修改语言为 `en-US`；
+4. 清理旧 Claude 客户端硬件指纹残留；
+5. 请求 Cloudflare 进行实时出口 IP 与区域自检。
+
+### 2. 恢复日常工作模式
+
+当您用完 Claude，需要恢复中国时区（UTC+8）及日常办公环境时，运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Disable-ClaudeStealth.ps1
 ```
 
 ---
 
-## 备考材料（附录）
+## 🔍 配合建议
 
-求职向的面试记录、JD 调研与简历要点集中在 [`docs/prep/`](docs/prep/)，与主线的工程内容分开维护。
+1. **浏览器环境**：建议在 Chrome 地址栏访问 `chrome://flags/#enable-webrtc-hide-local-ips-with-mdns` 并设为 **Enabled**；
+2. **节点选择**：在代理客户端中挑选带有 **“原生”、“家庭宽带”** 标签的节点，避免使用纯机房（Google Cloud、AWS、Azure）IP；
+3. **无痕模式**：建议使用 Chrome **无痕窗口（Ctrl + Shift + N）** 访问 Claude，避免历史缓存与被污染的 Cookie 干扰。
 
 ---
 
-## 安全
+## ⚖️ 免责声明 (Disclaimer)
 
-不要把 API Key 提交到 Git。`.env` 已在 `.gitignore` 中；Trace 与 fixture 入库前做脱敏处理。
-
-## License
-
-MIT
+本项目仅供网络协议安全测试、WebRTC 防泄漏研究与个人技术交流使用。请遵守当地法律法规以及相关平台的服务条款。

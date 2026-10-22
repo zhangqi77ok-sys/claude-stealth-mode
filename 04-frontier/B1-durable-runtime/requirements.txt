@@ -1,2 +1,0 @@
-temporalio>=1.27.0
-pytest>=8.0
