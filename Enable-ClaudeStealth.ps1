@@ -20,9 +20,11 @@ $proxyHttp = "http://127.0.0.1:$ProxyPort"
 $proxySocks = "socks5://127.0.0.1:$ProxyPort"
 
 # -------------------------------------------------------------------------
-# 1. 注入用户级环境变量：彻底堵死桌面端代码子进程（PowerShell/Git/Node）的裸连泄露
+# 1. 注入用户级环境变量 + PowerShell Profile：彻底堵死桌面端代码子进程的裸连泄露
 # -------------------------------------------------------------------------
-Write-Host "`n[1/5] 正在配置系统与 CLI 代理环境变量..." -ForegroundColor Yellow
+Write-Host "`n[1/6] 正在配置系统与 CLI 代理环境变量..." -ForegroundColor Yellow
+
+# 1.1 写入注册表用户环境变量
 [System.Environment]::SetEnvironmentVariable("HTTP_PROXY", $proxyHttp, "User")
 [System.Environment]::SetEnvironmentVariable("HTTPS_PROXY", $proxyHttp, "User")
 [System.Environment]::SetEnvironmentVariable("ALL_PROXY", $proxySocks, "User")
@@ -33,7 +35,39 @@ $env:HTTPS_PROXY = $proxyHttp
 $env:ALL_PROXY = $proxySocks
 $env:NO_PROXY = "localhost,127.0.0.1"
 
-# 顺便配置 Git 代理（桌面端写代码调用 git 时不再泄露）
+# 1.2 注入 PowerShell / Windows PowerShell 启动 Profile（保证 Claude 桌面端拉起 powershell.exe 时百分之百带代理）
+$psProfileDirs = @(
+    "$env:USERPROFILE\Documents\WindowsPowerShell",
+    "$env:USERPROFILE\Documents\PowerShell"
+)
+$profileSnippet = @"
+# === Claude Stealth Mode Proxy Auto-Inject ===
+`$env:HTTP_PROXY = "$proxyHttp"
+`$env:HTTPS_PROXY = "$proxyHttp"
+`$env:ALL_PROXY = "$proxySocks"
+`$env:NO_PROXY = "localhost,127.0.0.1"
+"@
+
+foreach ($dir in $psProfileDirs) {
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $p1 = Join-Path $dir "profile.ps1"
+    Set-Content -Path $p1 -Value $profileSnippet -Encoding UTF8 -Force
+}
+Write-Host "  ✅ PowerShell 自动加载 Profile 已注入 (彻底保障桌面端写代码)" -ForegroundColor Green
+
+# 1.3 广播系统环境变量变更 (WM_SETTINGCHANGE)，通知新开软件即刻生效
+try {
+    Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @'
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);
+'@
+    $result = [System.UIntPtr]::Zero
+    [Win32.NativeMethods]::SendMessageTimeout([System.IntPtr]0xffff, 0x001A, [System.UIntPtr]::Zero, "Environment", 2, 5000, [ref]$result) | Out-Null
+} catch {}
+
+# 1.4 配置 Git 全局代理
 if (Get-Command git -ErrorAction SilentlyContinue) {
     git config --global http.proxy $proxyHttp
     git config --global https.proxy $proxyHttp
@@ -44,15 +78,15 @@ Write-Host "  ✅ 命令行与子进程代理已生效 (HTTP_PROXY / HTTPS_PROXY
 # -------------------------------------------------------------------------
 # 2. 切换系统时区为美国太平洋时间，并锁定防止系统自动改回
 # -------------------------------------------------------------------------
-Write-Host "`n[2/5] 正在修改并锁定系统时区为 [$Timezone]..." -ForegroundColor Yellow
+Write-Host "`n[2/6] 正在修改系统时区为 [$Timezone]..." -ForegroundColor Yellow
 tzutil /s $Timezone
 $currentTz = tzutil /g
 Write-Host "  ✅ 当前系统时区已切换为: $currentTz" -ForegroundColor Green
 
 # -------------------------------------------------------------------------
-# 3. 封堵 Chrome 浏览器的 WebRTC 真实 IP 泄漏
+# 3. 封堵 Chrome 浏览器的 WebRTC 真实 IP 泄漏与语言
 # -------------------------------------------------------------------------
-Write-Host "`n[3/5] 正在配置 Chrome 浏览器 WebRTC 防泄漏策略..." -ForegroundColor Yellow
+Write-Host "`n[3/6] 正在配置 Chrome 浏览器 WebRTC 防泄漏策略与语言..." -ForegroundColor Yellow
 $chromePrefPath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Preferences"
 if (Test-Path $chromePrefPath) {
     try {
@@ -86,14 +120,12 @@ if (Test-Path $chromePrefPath) {
     } catch {
         Write-Host "  ⚠️ 写入 Chrome Preferences 失败（可能浏览器正打开），已跳过" -ForegroundColor DarkYellow
     }
-} else {
-    Write-Host "  ℹ️ 未检测到 Chrome 默认配置文件路径" -ForegroundColor DarkGray
 }
 
 # -------------------------------------------------------------------------
 # 4. 清理旧的 Claude 桌面端与浏览器缓存残留
 # -------------------------------------------------------------------------
-Write-Host "`n[4/5] 正在扫描并清理 Claude 历史设备指纹与沙箱残留..." -ForegroundColor Yellow
+Write-Host "`n[4/6] 正在扫描并清理 Claude 历史设备指纹与沙箱残留..." -ForegroundColor Yellow
 $claudePkgData = "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache"
 if (Test-Path $claudePkgData) {
     Remove-Item -Path $claudePkgData -Recurse -Force -ErrorAction SilentlyContinue
@@ -105,7 +137,7 @@ Write-Host "  ✅ 已清理临时执行沙箱文件" -ForegroundColor Green
 # -------------------------------------------------------------------------
 # 5. 实时检测外网出口与纯净度验证
 # -------------------------------------------------------------------------
-Write-Host "`n[5/5] 正在发起外网出口连通性与泄漏检测..." -ForegroundColor Yellow
+Write-Host "`n[5/6] 正在发起外网出口连通性与泄漏检测..." -ForegroundColor Yellow
 try {
     $trace = Invoke-RestMethod -Uri "https://www.cloudflare.com/cdn-cgi/trace" -Proxy $proxyHttp -TimeoutSec 6
     $loc = ($trace -split "`n" | Where-Object { $_ -match "^loc=" }) -replace "loc=", ""
