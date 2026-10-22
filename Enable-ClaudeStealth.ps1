@@ -80,6 +80,8 @@ Write-Host "  ✅ 命令行与子进程代理已生效 (HTTP_PROXY / HTTPS_PROXY
 # -------------------------------------------------------------------------
 Write-Host "`n[2/6] 正在修改系统时区为 [$Timezone]..." -ForegroundColor Yellow
 tzutil /s $Timezone
+Set-WinHomeLocation -GeoId 244
+Write-Host "  ✅ Windows 归属区域已自动设为: 美国 (GeoID 244)" -ForegroundColor Green
 $currentTz = tzutil /g
 Write-Host "  ✅ 当前系统时区已切换为: $currentTz" -ForegroundColor Green
 
@@ -188,3 +190,4 @@ Write-Host "`n==========================================================" -Foreg
 Write-Host "  ✨ 隐身保护已就绪！您现在可以安全地使用浏览器或桌面端了。" -ForegroundColor Green
 Write-Host "  💡 平时不用时，可运行同目录下的 [Disable-ClaudeStealth.ps1] 一键复原。" -ForegroundColor DarkGray
 Write-Host "==========================================================" -ForegroundColor Cyan
+

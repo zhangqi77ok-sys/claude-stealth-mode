@@ -44,6 +44,8 @@ Write-Host "  ✅ 命令行环境变量已复原" -ForegroundColor Green
 # 2. 恢复系统时区为中国标准时间
 Write-Host "`n[2/4] 正在恢复系统时区为 [China Standard Time]..." -ForegroundColor Yellow
 tzutil /s "China Standard Time"
+Set-WinHomeLocation -GeoId 45
+Write-Host "  ✅ Windows 归属区域已恢复为: 中国 (GeoID 45)" -ForegroundColor Green
 $currentTz = tzutil /g
 Write-Host "  ✅ 当前系统时区已恢复为: $currentTz" -ForegroundColor Green
 
@@ -77,3 +79,4 @@ try {
 Write-Host "`n==========================================================" -ForegroundColor Cyan
 Write-Host "  🎉 所有设置已成功还原为中国正常状态！" -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan
+
