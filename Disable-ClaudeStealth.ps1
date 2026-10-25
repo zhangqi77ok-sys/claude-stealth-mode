@@ -46,19 +46,22 @@ if ($snapshot -and $snapshot.OriginalV6Adapters) {
 Write-Host "  ✅ IPv6 协议栈与出站访问已恢复" -ForegroundColor Green
 
 # -------------------------------------------------------------------------
-# 2. 恢复 Windows 智能多宿主 DNS (SMHNR)
+# 2. 恢复 Windows 智能多宿主 DNS (SMHNR) 与系统定位
 # -------------------------------------------------------------------------
-Write-Host "`n[2/6] 正在恢复 Windows 默认 DNS 解析策略..." -ForegroundColor Yellow
+Write-Host "`n[2/6] 正在恢复 Windows 默认 DNS 解析与定位策略..." -ForegroundColor Yellow
 Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Name "DisableSmartNameResolution" -ErrorAction SilentlyContinue
-Write-Host "  ✅ DNS 智能多宿主解析策略已恢复为系统默认" -ForegroundColor Green
+Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors" -Name "DisableLocation" -ErrorAction SilentlyContinue
+Write-Host "  ✅ DNS 智能多宿主解析与物理定位策略已恢复为系统默认" -ForegroundColor Green
 
 # -------------------------------------------------------------------------
-# 3. 清理 Windows 防火墙 WebRTC 拦截规则
+# 3. 清理 Windows 防火墙拦截与 Claude 熔断规则
 # -------------------------------------------------------------------------
-Write-Host "`n[3/6] 正在清除 WebRTC 防火墙拦截规则..." -ForegroundColor Yellow
+Write-Host "`n[3/6] 正在清除 WebRTC 防火墙拦截与 Claude Desktop 熔断规则..." -ForegroundColor Yellow
 Remove-NetFirewallRule -DisplayName "ClaudeStealth_Block_WebRTC_STUN" -ErrorAction SilentlyContinue
 Remove-NetFirewallRule -DisplayName "ClaudeStealth_Block_Chrome_UDP" -ErrorAction SilentlyContinue
-Write-Host "  ✅ Windows 防火墙出站规则已清除，恢复常规网络连接" -ForegroundColor Green
+Remove-NetFirewallRule -DisplayName "ClaudeStealth_ClaudeApp_KillSwitch" -ErrorAction SilentlyContinue
+Remove-NetFirewallRule -DisplayName "ClaudeStealth_ClaudeApp_Block_UDP" -ErrorAction SilentlyContinue
+Write-Host "  ✅ Windows 防火墙出站规则与客户端熔断已清除，恢复常规网络连接" -ForegroundColor Green
 
 # -------------------------------------------------------------------------
 # 4. 清理浏览器注册表企业策略与恢复中文偏好
@@ -72,6 +75,10 @@ foreach ($bPath in $browserPolicyPaths) {
     if (Test-Path $bPath) {
         Remove-ItemProperty -Path $bPath -Name "WebRtcIPHandlingPolicy" -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path $bPath -Name "ApplicationLocaleValue" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $bPath -Name "QuicAllowed" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $bPath -Name "BuiltInDnsClientEnabled" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $bPath -Name "DefaultGeolocationSetting" -ErrorAction SilentlyContinue
+        
         $forcedLangPath = Join-Path $bPath "ForcedLanguages"
         if (Test-Path $forcedLangPath) {
             Remove-Item -Path $forcedLangPath -Recurse -Force -ErrorAction SilentlyContinue
@@ -101,7 +108,7 @@ if (Test-Path $userDataDir) {
         }
     }
 }
-Write-Host "  ✅ 浏览器底层 WebRTC 策略与首选中文语言已恢复" -ForegroundColor Green
+Write-Host "  ✅ 浏览器底层 QUIC、DNS、WebRTC 策略与首选中文语言已恢复" -ForegroundColor Green
 
 # -------------------------------------------------------------------------
 # 5. 恢复系统时区与区域归属
