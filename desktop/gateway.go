@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,15 +14,23 @@ import (
 
 // ConnectionLog 代表一条连接的流入流出审计记录
 type ConnectionLog struct {
-	ID        string `json:"id"`
-	Time      string `json:"time"`
-	Host      string `json:"host"`
-	Method    string `json:"method"`
-	BytesIn   uint64 `json:"bytesIn"`
-	BytesOut  uint64 `json:"bytesOut"`
-	Status    string `json:"status"` // "Active", "Closed", "Blocked"
-	Duration  string `json:"duration"`
-	StartTime time.Time
+	ID        string    `json:"id"`
+	Time      string    `json:"time"`
+	Host      string    `json:"host"`
+	Method    string    `json:"method"`
+	BytesIn   uint64    `json:"bytesIn"`
+	BytesOut  uint64    `json:"bytesOut"`
+	Status    string    `json:"status"` // "Active", "Closed", "Blocked"
+	Duration  string    `json:"duration"`
+	IsClaude  bool      `json:"isClaude"`
+	StartTime time.Time `json:"-"`
+}
+
+func isClaudeHost(host string) bool {
+	h := strings.ToLower(host)
+	return strings.Contains(h, "claude.ai") ||
+		strings.Contains(h, "anthropic.com") ||
+		strings.Contains(h, "challenges.cloudflare.com")
 }
 
 // Gateway 统一安全网关与流量监控器
@@ -51,7 +60,7 @@ func NewGateway(listenAddr, upstreamProxy string) *Gateway {
 	return &Gateway{
 		listenAddr:    listenAddr,
 		upstreamProxy: upstreamProxy,
-		logs:          make([]*ConnectionLog, 0, 50),
+		logs:          make([]*ConnectionLog, 0, 100),
 		stopChan:      make(chan struct{}),
 	}
 }
@@ -88,6 +97,24 @@ func (g *Gateway) Stop() error {
 		return g.server.Close()
 	}
 	return nil
+}
+
+func (g *Gateway) ClearLogs() {
+	g.logsLock.Lock()
+	defer g.logsLock.Unlock()
+	g.logs = make([]*ConnectionLog, 0, 100)
+}
+
+func (g *Gateway) SetUpstream(proxyURL string) {
+	g.logsLock.Lock()
+	defer g.logsLock.Unlock()
+	g.upstreamProxy = proxyURL
+}
+
+func (g *Gateway) GetUpstream() string {
+	g.logsLock.RLock()
+	defer g.logsLock.RUnlock()
+	return g.upstreamProxy
 }
 
 func (g *Gateway) speedCalculator() {
@@ -132,6 +159,7 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		Host:      r.Host,
 		Method:    "CONNECT",
 		Status:    "Active",
+		IsClaude:  isClaudeHost(r.Host),
 		StartTime: startTime,
 	}
 	g.addLog(connLog)
@@ -139,14 +167,15 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	var upstreamConn net.Conn
 	var err error
 
-	// 如果配置了上游代理 (如 Clash Verge 127.0.0.1:7897)，则向代理发起 CONNECT 握手
-	if g.upstreamProxy != "" {
-		u, parseErr := url.Parse(g.upstreamProxy)
+	upstreamProxy := g.GetUpstream()
+	// 如果配置了上游代理 (如 127.0.0.1:7897)，则向代理发起 CONNECT 握手
+	if upstreamProxy != "" {
+		u, parseErr := url.Parse(upstreamProxy)
 		if parseErr == nil && u.Host != "" {
 			d := net.Dialer{Timeout: 6 * time.Second}
 			upstreamConn, err = d.Dial("tcp", u.Host)
 			if err == nil {
-				// 向 Clash 发送 HTTP CONNECT
+				// 向上游代理发送 HTTP CONNECT
 				connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", r.Host, r.Host)
 				_, err = upstreamConn.Write([]byte(connectReq))
 				if err == nil {
@@ -249,6 +278,7 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 		Host:      r.URL.Host,
 		Method:    r.Method,
 		Status:    "Active",
+		IsClaude:  isClaudeHost(r.URL.Host),
 		StartTime: startTime,
 	}
 	g.addLog(connLog)
@@ -256,11 +286,12 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	// 自动清洗请求头中的语言特征
 	r.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
+	upstreamProxy := g.GetUpstream()
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 	}
-	if g.upstreamProxy != "" {
-		if u, err := url.Parse(g.upstreamProxy); err == nil {
+	if upstreamProxy != "" {
+		if u, err := url.Parse(upstreamProxy); err == nil {
 			transport.Proxy = http.ProxyURL(u)
 		}
 	}
@@ -310,7 +341,7 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) addLog(l *ConnectionLog) {
 	g.logsLock.Lock()
 	defer g.logsLock.Unlock()
-	if len(g.logs) >= 50 {
+	if len(g.logs) >= 80 {
 		g.logs = g.logs[1:]
 	}
 	g.logs = append(g.logs, l)
@@ -324,11 +355,12 @@ func (g *Gateway) GetStats() map[string]interface{} {
 	copy(recentLogs, g.logs)
 
 	return map[string]interface{}{
-		"speedIn":     atomic.LoadUint64(&g.speedIn),
-		"speedOut":    atomic.LoadUint64(&g.speedOut),
-		"totalIn":     atomic.LoadUint64(&g.totalIn),
-		"totalOut":    atomic.LoadUint64(&g.totalOut),
-		"activeConns": atomic.LoadInt32(&g.activeConn),
-		"logs":        recentLogs,
+		"speedIn":       atomic.LoadUint64(&g.speedIn),
+		"speedOut":      atomic.LoadUint64(&g.speedOut),
+		"totalIn":       atomic.LoadUint64(&g.totalIn),
+		"totalOut":      atomic.LoadUint64(&g.totalOut),
+		"activeConns":   atomic.LoadInt32(&g.activeConn),
+		"upstreamProxy": g.upstreamProxy,
+		"logs":          recentLogs,
 	}
 }

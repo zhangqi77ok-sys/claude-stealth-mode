@@ -2,6 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,14 +24,32 @@ type App struct {
 	gateway         *Gateway
 	origProxyServer string
 	origProxyEnable uint32
+	upstreamPort    string
+}
+
+// 自动探测本地常用代理软件的运行端口
+func probeLocalProxyPort() string {
+	candidates := []string{"7897", "7890", "10808", "10809", "2080", "1080"}
+	for _, p := range candidates {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+p, 120*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return p
+		}
+	}
+	return "7897"
 }
 
 func NewApp() *App {
-	gw := NewGateway("127.0.0.1:8999", "http://127.0.0.1:7897")
+	detectedPort := probeLocalProxyPort()
+	upstream := "http://127.0.0.1:" + detectedPort
+
+	gw := NewGateway("127.0.0.1:8999", upstream)
 	return &App{
 		gateway:         gw,
-		origProxyServer: "127.0.0.1:7897",
+		origProxyServer: "127.0.0.1:" + detectedPort,
 		origProxyEnable: 1,
+		upstreamPort:    detectedPort,
 	}
 }
 
@@ -36,7 +59,7 @@ func (a *App) startup(ctx context.Context) {
 	// 1. 启动本地流控网关 (监听 127.0.0.1:8999)
 	_ = a.gateway.Start()
 
-	// 2. 将 Windows 系统代理切换至本网关 127.0.0.1:8999，确保所有 Chrome/Edge/Claude 流量经过此网关
+	// 2. 将 Windows 系统代理切换至本网关 127.0.0.1:8999
 	a.setWindowsProxy(true)
 
 	// 3. 启动后台事件推送：每秒向前端广播当前流入流出速率与总流量
@@ -51,7 +74,6 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
-	// 退出时无损还原系统代理
 	a.setWindowsProxy(false)
 	_ = a.gateway.Stop()
 }
@@ -80,14 +102,13 @@ func (a *App) setWindowsProxy(enable bool) {
 		}
 	}
 
-	// 刷新 WinINet 缓存，使浏览器无需重启即刻生效
 	wininet := syscall.NewLazyDLL("wininet.dll")
 	setOption := wininet.NewProc("InternetSetOptionW")
-	setOption.Call(0, 39, 0, 0) // INTERNET_OPTION_SETTINGS_CHANGED
-	setOption.Call(0, 37, 0, 0) // INTERNET_OPTION_REFRESH
+	setOption.Call(0, 39, 0, 0)
+	setOption.Call(0, 37, 0, 0)
 }
 
-// findScript 智能定位脚本绝对路径 (兼容在 bin、desktop、根目录各种运行场景)
+// findScript 智能定位脚本绝对路径
 func findScript(scriptName string) string {
 	if exePath, err := os.Executable(); err == nil {
 		exeDir := filepath.Dir(exePath)
@@ -133,7 +154,6 @@ func (a *App) ToggleStealth(enable bool) (string, error) {
 		a.setWindowsProxy(false)
 	}
 
-	// 以 RunAs 管理员提权运行对应 PowerShell 脚本 (指定 ProxyPort 为 8999 网关)
 	args := "-NoProfile -ExecutionPolicy Bypass -File \"" + scriptPath + "\" -NoBrowser"
 	if enable {
 		args += " -ProxyPort 8999"
@@ -157,7 +177,6 @@ func (a *App) ToggleStealth(enable bool) (string, error) {
 func (a *App) GetStatus() map[string]interface{} {
 	testerScript := findScript("Test-ClaudeStealth.ps1")
 
-	// 快速探测当前系统时区与防火墙规则状态
 	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", testerScript)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, _ := cmd.CombinedOutput()
@@ -169,15 +188,173 @@ func (a *App) GetStatus() map[string]interface{} {
 	hasSmhnr := strings.Contains(outputStr, "智能多宿主名称解析 (SMHNR) 已禁用")
 
 	return map[string]interface{}{
-		"isProtected": isProtected,
-		"hasWebRtc":   hasWebRtc,
-		"hasV6Block":  hasV6Block,
-		"hasSmhnr":    hasSmhnr,
-		"rawReport":   outputStr,
+		"isProtected":   isProtected,
+		"hasWebRtc":     hasWebRtc,
+		"hasV6Block":    hasV6Block,
+		"hasSmhnr":      hasSmhnr,
+		"upstreamPort":  a.upstreamPort,
+		"rawReport":     outputStr,
 	}
 }
 
 // GetTrafficNow 手动拉取当前网关流量数据
 func (a *App) GetTrafficNow() map[string]interface{} {
-	return a.gateway.GetStats()
+	stats := a.gateway.GetStats()
+	stats["upstreamPort"] = a.upstreamPort
+	return stats
+}
+
+// ClearTrafficLogs 清空网关历史日志
+func (a *App) ClearTrafficLogs() bool {
+	a.gateway.ClearLogs()
+	return true
+}
+
+// SetUpstreamPort 手动或自动切换上游代理端口 (如 7897, 7890, 10808)
+func (a *App) SetUpstreamPort(port string) string {
+	cleanPort := strings.TrimSpace(port)
+	if cleanPort == "" {
+		cleanPort = "7897"
+	}
+	a.upstreamPort = cleanPort
+	upstreamURL := "http://127.0.0.1:" + cleanPort
+	a.gateway.SetUpstream(upstreamURL)
+	return fmt.Sprintf("已切换上游代理至 127.0.0.1:%s", cleanPort)
+}
+
+// TestNodeLatency 实时探测节点出口 IP、归属国与网络延迟 (经由网关 8999 探测)
+func (a *App) TestNodeLatency() map[string]interface{} {
+	proxyURL, _ := url.Parse("http://127.0.0.1:8999")
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	start := time.Now()
+	resp, err := client.Get("https://www.cloudflare.com/cdn-cgi/trace")
+	latency := time.Since(start).Milliseconds()
+
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+			"latency": latency,
+		}
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyStr := string(bodyBytes)
+
+	ip := ""
+	loc := ""
+	lines := strings.Split(bodyStr, "\n")
+	for _, l := range lines {
+		if strings.HasPrefix(l, "ip=") {
+			ip = strings.TrimPrefix(l, "ip=")
+		}
+		if strings.HasPrefix(l, "loc=") {
+			loc = strings.TrimPrefix(l, "loc=")
+		}
+	}
+
+	return map[string]interface{}{
+		"success": true,
+		"latency": latency,
+		"ip":      ip,
+		"loc":     loc,
+		"isUS":    loc == "US",
+	}
+}
+
+// RunFullCheck 运行完整 10 项健康体检并返回结构化报告数据
+func (a *App) RunFullCheck() map[string]interface{} {
+	testerScript := findScript("Test-ClaudeStealth.ps1")
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", testerScript)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, _ := cmd.CombinedOutput()
+	output := string(out)
+
+	type CheckItem struct {
+		Title  string `json:"title"`
+		Passed bool   `json:"passed"`
+		Desc   string `json:"desc"`
+	}
+
+	items := []CheckItem{
+		{
+			Title:  "CLI 与子进程环境变量代理",
+			Passed: strings.Contains(output, "系统用户环境变量已注入"),
+			Desc:   "HTTP_PROXY / ALL_PROXY 已就绪",
+		},
+		{
+			Title:  "IPv4 出口与国家检测 (US)",
+			Passed: strings.Contains(output, "国家: US") || strings.Contains(output, "代理出口正常"),
+			Desc:   "节点出口归属美国，延迟良好",
+		},
+		{
+			Title:  "IPv6 旁路阻断防护",
+			Passed: strings.Contains(output, "IPv6 旁路已完全阻断"),
+			Desc:   "物理网卡与防火墙出站双重封死 IPv6",
+		},
+		{
+			Title:  "WebRTC STUN UDP 隔离",
+			Passed: strings.Contains(output, "Windows 防火墙已激活 STUN UDP 阻断规则"),
+			Desc:   "3478/19302 端口拦截，杜绝真实 IP 暴露",
+		},
+		{
+			Title:  "Windows 智能多宿主 DNS 封堵",
+			Passed: strings.Contains(output, "智能多宿主名称解析 (SMHNR) 已禁用"),
+			Desc:   "禁止向国内物理网卡并发探测 DNS",
+		},
+		{
+			Title:  "QUIC (HTTP/3 UDP 443) 禁用",
+			Passed: strings.Contains(output, "QUIC 协议已禁用"),
+			Desc:   "封死 UDP 443 旁路，强制走 TCP 代理安全通道",
+		},
+		{
+			Title:  "远端代理 DNS 强制解析",
+			Passed: strings.Contains(output, "浏览器异步 DNS 已禁用"),
+			Desc:   "域名解析完全委托远端代理 (Remote DNS)",
+		},
+		{
+			Title:  "HTML5 物理地理位置定位封锁",
+			Passed: strings.Contains(output, "浏览器物理定位已全面禁止"),
+			Desc:   "切断 Wi-Fi BSSID 物理位置穿透",
+		},
+		{
+			Title:  "系统时区与国家代码伪装",
+			Passed: strings.Contains(output, "Pacific Standard Time") || strings.Contains(output, "GeoID: 244"),
+			Desc:   "锁定美国太平洋时间与 GeoID 244",
+		},
+		{
+			Title:  "Claude Desktop 专属断网熔断 (Kill Switch)",
+			Passed: strings.Contains(output, "Claude Desktop 熔断已激活") || strings.Contains(output, "未检测到本地已安装的 Claude Desktop"),
+			Desc:   "严禁公网直连，代理异常物理断网 (Fail-Closed)",
+		},
+	}
+
+	passCount := 0
+	for _, it := range items {
+		if it.Passed {
+			passCount++
+		}
+	}
+
+	grade := "B 基础防护"
+	if passCount >= 10 {
+		grade = "A+ 极致隐身安全 (满分)"
+	} else if passCount >= 8 {
+		grade = "A 良好安全防护"
+	}
+
+	return map[string]interface{}{
+		"items":     items,
+		"score":     passCount,
+		"total":     len(items),
+		"grade":     grade,
+		"rawReport": output,
+	}
 }

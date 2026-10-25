@@ -1,26 +1,68 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { GetStatus, GetTrafficNow, ToggleStealth } from '../wailsjs/go/main/App'
+import { 
+  GetStatus, 
+  GetTrafficNow, 
+  ToggleStealth, 
+  SetUpstreamPort, 
+  ClearTrafficLogs, 
+  TestNodeLatency, 
+  RunFullCheck 
+} from '../wailsjs/go/main/App'
 
 // 状态数据
 const isProtected = ref(false)
 const isLoading = ref(false)
-const statusMessage = ref('网关正在监听 127.0.0.1:8999')
+const statusMessage = ref('安全网关正在监听 127.0.0.1:8999')
+const upstreamPort = ref('7897')
 
-// 流量数据
-const speedIn = ref(0)       // Bytes/s
-const speedOut = ref(0)      // Bytes/s
-const totalIn = ref(0)       // Bytes
-const totalOut = ref(0)      // Bytes
+// 流量监控数据
+const speedIn = ref(0)
+const speedOut = ref(0)
+const totalIn = ref(0)
+const totalOut = ref(0)
 const activeConns = ref(0)
 const connectionLogs = ref([])
 
-// 实时折线图历史点 (最近 30 秒)
+// 节点出口探测
+const nodeInfo = ref({
+  ip: '--',
+  loc: '--',
+  latency: 0,
+  isUS: false,
+  isTesting: false
+})
+
+// 日志分类筛选
+const filterMode = ref('all') // 'all', 'claude', 'active'
+const filteredLogs = computed(() => {
+  if (filterMode.value === 'claude') {
+    return connectionLogs.value.filter(l => l.isClaude)
+  }
+  if (filterMode.value === 'active') {
+    return connectionLogs.value.filter(l => l.status === 'Active')
+  }
+  return connectionLogs.value
+})
+
+const claudeLogCount = computed(() => connectionLogs.value.filter(l => l.isClaude).length)
+const activeLogCount = computed(() => connectionLogs.value.filter(l => l.status === 'Active').length)
+
+// 10项体检弹窗
+const showCheckModal = ref(false)
+const isCheckingHealth = ref(false)
+const healthReport = ref({
+  score: 10,
+  total: 10,
+  grade: 'A+ 极致隐身安全 (满分)',
+  items: []
+})
+
+// 折线图历史队列 (30 秒)
 const historyIn = ref(new Array(30).fill(0))
 const historyOut = ref(new Array(30).fill(0))
 
-// 格式化函数
 function formatBytes(bytes) {
   if (!bytes || bytes === 0) return '0 B'
   const k = 1024
@@ -33,7 +75,7 @@ function formatSpeed(bytesPerSec) {
   return formatBytes(bytesPerSec) + '/s'
 }
 
-// 切换防护模式
+// 切换防护
 async function handleToggle() {
   isLoading.value = true
   const targetState = !isProtected.value
@@ -50,17 +92,73 @@ async function handleToggle() {
   }
 }
 
-// 刷新状态检测
+// 探测节点延迟与出口
+async function checkNodeLatency() {
+  if (nodeInfo.value.isTesting) return
+  nodeInfo.value.isTesting = true
+  try {
+    const res = await TestNodeLatency()
+    if (res && res.success) {
+      nodeInfo.value.ip = res.ip || '已连接'
+      nodeInfo.value.loc = res.loc || 'US'
+      nodeInfo.value.latency = res.latency || 0
+      nodeInfo.value.isUS = res.isUS
+      statusMessage.value = `节点连通正常: ${res.ip} (${res.loc}) · 延迟 ${res.latency}ms`
+    } else {
+      statusMessage.value = '节点探测失败: ' + (res?.error || '连接超时')
+    }
+  } catch (err) {
+    statusMessage.value = '探测异常: ' + (err?.message || err)
+  } finally {
+    nodeInfo.value.isTesting = false
+  }
+}
+
+// 更改上游代理端口
+async function promptChangePort() {
+  const current = upstreamPort.value || '7897'
+  const newPort = window.prompt('请输入本地代理软件的 HTTP/SOCKS 端口 (例如 Clash Verge 为 7897，Clash 为 7890，v2rayN 为 10809):', current)
+  if (newPort && newPort.trim() && newPort !== current) {
+    const res = await SetUpstreamPort(newPort.trim())
+    upstreamPort.value = newPort.trim()
+    statusMessage.value = res
+  }
+}
+
+// 清空日志
+async function handleClearLogs() {
+  await ClearTrafficLogs()
+  connectionLogs.value = []
+  statusMessage.value = '已清空本地连接审计日志'
+}
+
+// 运行完整 10 项健康体检
+async function runHealthCheck() {
+  showCheckModal.value = true
+  isCheckingHealth.value = true
+  try {
+    const rep = await RunFullCheck()
+    if (rep && rep.items) {
+      healthReport.value = rep
+    }
+  } catch (err) {
+    console.error(err)
+  } finally {
+    isCheckingHealth.value = false
+  }
+}
+
+// 状态同步
 async function refreshStatus() {
   try {
     const res = await GetStatus()
     if (res) {
       isProtected.value = res.isProtected
+      if (res.upstreamPort) upstreamPort.value = res.upstreamPort
     }
   } catch {}
 }
 
-// 接收来自 Go 端的每秒推流数据
 function handleTrafficUpdate(data) {
   if (!data) return
   speedIn.value = data.speedIn || 0
@@ -68,12 +166,12 @@ function handleTrafficUpdate(data) {
   totalIn.value = data.totalIn || 0
   totalOut.value = data.totalOut || 0
   activeConns.value = data.activeConns || 0
+  if (data.upstreamPort) upstreamPort.value = data.upstreamPort
 
   if (data.logs && Array.isArray(data.logs)) {
     connectionLogs.value = data.logs.slice().reverse()
   }
 
-  // 更新历史折线队列
   historyIn.value.push(data.speedIn || 0)
   historyIn.value.shift()
 
@@ -81,12 +179,11 @@ function handleTrafficUpdate(data) {
   historyOut.value.shift()
 }
 
-// 计算 SVG 折线路径
 const svgPathIn = computed(() => makeSvgPath(historyIn.value, '#10b981'))
 const svgPathOut = computed(() => makeSvgPath(historyOut.value, '#f43f5e'))
 
 function makeSvgPath(dataArr) {
-  const max = Math.max(...dataArr, 1024) // 最小基准 1KB
+  const max = Math.max(...dataArr, 1024)
   const width = 600
   const height = 90
   const step = width / (dataArr.length - 1)
@@ -102,17 +199,14 @@ function makeSvgPath(dataArr) {
 
 onMounted(() => {
   refreshStatus()
+  checkNodeLatency()
 
-  // 1. 注册 Wails 事件推流
   try {
     EventsOn('traffic-tick', (data) => {
       handleTrafficUpdate(data)
     })
-  } catch (e) {
-    console.error('EventsOn error:', e)
-  }
+  } catch (e) {}
 
-  // 2. 双保险：启动 1 秒心跳主动轮询，确保与网关真实吞吐 100% 同步
   const syncTimer = setInterval(async () => {
     try {
       const stats = await GetTrafficNow()
@@ -140,7 +234,22 @@ onMounted(() => {
         </div>
       </div>
 
+      <!-- 节点出口与测速条目 -->
+      <div class="node-status-bar" @click="checkNodeLatency" title="点击立即重新测速">
+        <span class="status-dot" :class="nodeInfo.isUS ? 'dot-green' : 'dot-yellow'"></span>
+        <span class="node-info-text">
+          <span v-if="nodeInfo.isTesting">正在测速...</span>
+          <span v-else>
+            {{ nodeInfo.loc }}: {{ nodeInfo.ip }} ({{ nodeInfo.latency }}ms)
+          </span>
+        </span>
+        <button class="mini-btn" :disabled="nodeInfo.isTesting">⚡ 测速</button>
+      </div>
+
       <div class="header-right">
+        <button class="health-check-btn" @click="runHealthCheck">
+          🩺 10项体检
+        </button>
         <span class="status-badge" :class="isProtected ? 'badge-safe' : 'badge-idle'">
           {{ isProtected ? '● 防护已激活 (极致隐身)' : '○ 常规日常模式' }}
         </span>
@@ -158,7 +267,7 @@ onMounted(() => {
 
     <!-- 主仪表盘内容 -->
     <main class="dashboard-content">
-      <!-- 流量监控大卡片 (流入 / 流出) -->
+      <!-- 流量监控大卡片 (流入 / 流出 / 网关) -->
       <section class="traffic-metrics-row">
         <!-- 流入卡片 -->
         <div class="metric-card card-inflow">
@@ -205,7 +314,9 @@ onMounted(() => {
             </div>
             <div class="gateway-info-row">
               <span>上游代理:</span>
-              <span>127.0.0.1:7897 (Clash)</span>
+              <span class="upstream-tag" @click="promptChangePort" title="点击更改端口">
+                127.0.0.1:<strong>{{ upstreamPort }}</strong> ⚙️
+              </span>
             </div>
             <div class="gateway-info-row">
               <span>协议过滤:</span>
@@ -226,12 +337,10 @@ onMounted(() => {
         </div>
         <div class="chart-wrapper">
           <svg viewBox="0 0 600 90" preserveAspectRatio="none" class="traffic-svg">
-            <!-- 网格线 -->
             <line x1="0" y1="20" x2="600" y2="20" stroke="#1e293b" stroke-dasharray="3,3" />
             <line x1="0" y1="50" x2="600" y2="50" stroke="#1e293b" stroke-dasharray="3,3" />
             <line x1="0" y1="80" x2="600" y2="80" stroke="#1e293b" stroke-dasharray="3,3" />
             
-            <!-- 流入流出路径 -->
             <path :d="svgPathIn" fill="none" stroke="#10b981" stroke-width="2.5" />
             <path :d="svgPathOut" fill="none" stroke="#f43f5e" stroke-width="2.5" />
           </svg>
@@ -240,38 +349,69 @@ onMounted(() => {
 
       <!-- 10 项防护健康指示标 -->
       <section class="security-badges-bar">
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> IPv6 旁路封堵
         </div>
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> WebRTC STUN 隔离
         </div>
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> Windows 多宿主 DNS 封堵
         </div>
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> QUIC (UDP 443) 禁用
         </div>
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> 远程代理 DNS 解析
         </div>
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> HTML5 物理定位禁用
         </div>
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> Claude 客户端断网熔断
         </div>
-        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'">
+        <div class="badge-item" :class="isProtected ? 'badge-on' : 'badge-off'" @click="runHealthCheck">
           <span class="dot"></span> 美区时区锁定 (PST)
         </div>
       </section>
 
-      <!-- 活跃连接审计流水表 (流入流出详情) -->
+      <!-- 活跃连接审计流水表 (带过滤与 Claude 高亮) -->
       <section class="connections-table-card">
         <div class="panel-header">
-          <span class="panel-title">📋 实时数据连接审计日志 (Active Connections)</span>
-          <span class="badge-count">已记录 {{ connectionLogs.length }} 条记录</span>
+          <div class="filter-group">
+            <span class="panel-title">📋 实时数据连接审计日志</span>
+            <div class="filter-tabs">
+              <button 
+                class="tab-btn" 
+                :class="{ active: filterMode === 'all' }" 
+                @click="filterMode = 'all'"
+              >
+                全部流量 ({{ connectionLogs.length }})
+              </button>
+              <button 
+                class="tab-btn tab-claude" 
+                :class="{ active: filterMode === 'claude' }" 
+                @click="filterMode = 'claude'"
+              >
+                🟣 仅看 Claude ({{ claudeLogCount }})
+              </button>
+              <button 
+                class="tab-btn" 
+                :class="{ active: filterMode === 'active' }" 
+                @click="filterMode = 'active'"
+              >
+                ⚡ 活跃连接 ({{ activeLogCount }})
+              </button>
+            </div>
+          </div>
+
+          <div class="action-buttons">
+            <button class="clear-btn" @click="handleClearLogs" title="清空日志流水">
+              🗑️ 清空日志
+            </button>
+          </div>
         </div>
+
         <div class="table-container">
           <table class="audit-table">
             <thead>
@@ -285,20 +425,29 @@ onMounted(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="log in connectionLogs" :key="log.id">
+              <tr 
+                v-for="log in filteredLogs" 
+                :key="log.id"
+                :class="{ 'row-claude': log.isClaude }"
+              >
                 <td class="col-time">{{ log.time }}</td>
-                <td class="col-host">{{ log.host }}</td>
+                <td class="col-host">
+                  <span v-if="log.isClaude" class="claude-badge">🟣 Claude 专线</span>
+                  {{ log.host }}
+                </td>
                 <td><span class="method-tag">{{ log.method }}</span></td>
                 <td class="text-rose font-mono">↑ {{ formatBytes(log.bytesOut) }}</td>
                 <td class="text-emerald font-mono">↓ {{ formatBytes(log.bytesIn) }}</td>
                 <td>
                   <span class="status-tag" :class="log.status === 'Active' ? 'tag-active' : (log.status === 'Blocked' ? 'tag-blocked' : 'tag-closed')">
-                    {{ log.status === 'Active' ? '活跃连接' : (log.status === 'Blocked' ? '🛡️已拦截' : '已完成') }}
+                    {{ log.status === 'Active' ? '活跃会话' : (log.status === 'Blocked' ? '🛡️已拦截' : '已完成') }}
                   </span>
                 </td>
               </tr>
-              <tr v-if="connectionLogs.length === 0">
-                <td colspan="6" class="empty-state">网关运行中，尚未捕获到连接请求（当通过本网关访问网络时将自动实时罗列）</td>
+              <tr v-if="filteredLogs.length === 0">
+                <td colspan="6" class="empty-state">
+                  {{ filterMode === 'claude' ? '暂未捕获到 Claude 相关流量请求（访问 claude.ai 时将自动罗列）' : '网关运行中，尚未捕获到连接请求' }}
+                </td>
               </tr>
             </tbody>
           </table>
@@ -311,6 +460,55 @@ onMounted(() => {
       <span>{{ statusMessage }}</span>
       <span>Claude Stealth Mode · 零泄露工业级架构</span>
     </footer>
+
+    <!-- 10 项防护指标健康体检弹窗 (Modal) -->
+    <div v-if="showCheckModal" class="modal-backdrop" @click.self="showCheckModal = false">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div class="modal-title-area">
+            <h3>🛡️ 系统防泄漏健康体检报告</h3>
+            <span class="modal-grade" :class="healthReport.score >= 10 ? 'grade-perfect' : 'grade-good'">
+              评级: {{ healthReport.grade }} ({{ healthReport.score }}/{{ healthReport.total }})
+            </span>
+          </div>
+          <button class="close-btn" @click="showCheckModal = false">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <div v-if="isCheckingHealth" class="modal-loading">
+            <span class="spinner"></span> 正在对 10 项底层网络、防火墙与注册表策略进行深度诊断...
+          </div>
+          <div v-else class="check-items-list">
+            <div 
+              v-for="(item, idx) in healthReport.items" 
+              :key="idx" 
+              class="check-item-row"
+              :class="item.passed ? 'check-pass' : 'check-fail'"
+            >
+              <div class="check-icon">
+                {{ item.passed ? '✅' : '⚠️' }}
+              </div>
+              <div class="check-info">
+                <div class="check-title">{{ idx + 1 }}. {{ item.title }}</div>
+                <div class="check-desc">{{ item.desc }}</div>
+              </div>
+              <div class="check-status-tag">
+                {{ item.passed ? '安全达标' : '需要加固' }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button class="modal-action-btn" :disabled="isCheckingHealth" @click="runHealthCheck">
+            🔄 重新检测
+          </button>
+          <button class="modal-close-btn" @click="showCheckModal = false">
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -324,6 +522,7 @@ onMounted(() => {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   user-select: none;
   overflow: hidden;
+  position: relative;
 }
 
 /* 顶部导航 */
@@ -331,9 +530,10 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 16px 24px;
+  padding: 12px 24px;
   background-color: #0f172a;
   border-bottom: 1px solid #1e293b;
+  gap: 16px;
 }
 
 .logo-area {
@@ -343,40 +543,106 @@ onMounted(() => {
 }
 
 .shield-icon {
-  font-size: 28px;
+  font-size: 26px;
 }
 
 .title {
   margin: 0;
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 700;
-  letter-spacing: -0.3px;
-  color: #f8fafc;
+  letter-spacing: -0.02em;
+  color: #ffffff;
 }
 
 .subtitle {
-  margin: 2px 0 0;
+  margin: 2px 0 0 0;
+  font-size: 11px;
+  color: #64748b;
+}
+
+/* 节点探测条 */
+.node-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background-color: rgba(30, 41, 59, 0.7);
+  border: 1px solid #334155;
+  padding: 4px 12px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.node-status-bar:hover {
+  background-color: rgba(51, 65, 85, 0.8);
+  border-color: #475569;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.dot-green {
+  background-color: #10b981;
+  box-shadow: 0 0 6px #10b981;
+}
+
+.dot-yellow {
+  background-color: #eab308;
+  box-shadow: 0 0 6px #eab308;
+}
+
+.node-info-text {
   font-size: 12px;
-  color: #94a3b8;
+  color: #cbd5e1;
+  font-family: monospace;
+}
+
+.mini-btn {
+  background: transparent;
+  border: none;
+  color: #38bdf8;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 2px;
 }
 
 .header-right {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
+}
+
+.health-check-btn {
+  background-color: rgba(30, 41, 59, 0.8);
+  border: 1px solid #334155;
+  color: #38bdf8;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.health-check-btn:hover {
+  background-color: #1e293b;
+  border-color: #38bdf8;
 }
 
 .status-badge {
-  padding: 6px 12px;
-  border-radius: 9999px;
-  font-size: 13px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 12px;
   font-weight: 600;
 }
 
 .badge-safe {
   background-color: rgba(16, 185, 129, 0.15);
   color: #10b981;
-  border: 1px solid rgba(16, 185, 129, 0.3);
+  border: 1px solid rgba(16, 185, 129, 0.4);
 }
 
 .badge-idle {
@@ -386,83 +652,114 @@ onMounted(() => {
 }
 
 .toggle-btn {
-  padding: 8px 20px;
-  border-radius: 8px;
-  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 18px;
+  border-radius: 6px;
   font-weight: 600;
-  cursor: pointer;
+  font-size: 13px;
   border: none;
-  transition: all 0.2s;
+  cursor: pointer;
+  transition: all 0.2s ease;
 }
 
 .btn-primary {
-  background-color: #0284c7;
-  color: #ffffff;
+  background-color: #2563eb;
+  color: white;
 }
 
 .btn-primary:hover {
-  background-color: #0369a1;
+  background-color: #1d4ed8;
 }
 
 .btn-danger {
   background-color: #e11d48;
-  color: #ffffff;
+  color: white;
 }
 
 .btn-danger:hover {
   background-color: #be123c;
 }
 
-/* 核心仪表盘布局 */
+.toggle-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 主内容区 */
 .dashboard-content {
   flex: 1;
-  padding: 18px 24px;
+  padding: 16px 24px;
   display: flex;
   flex-direction: column;
   gap: 14px;
   overflow-y: auto;
 }
 
-/* 流量卡片三列排布 */
+/* 流量卡片 */
 .traffic-metrics-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.2fr;
+  grid-template-columns: 1fr 1fr 1.1fr;
   gap: 14px;
 }
 
 .metric-card {
-  background-color: #131d33;
-  border: 1px solid #1e293b;
-  border-radius: 12px;
-  padding: 14px 16px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
+  background-color: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 10px;
+  padding: 14px 18px;
+}
+
+.card-inflow {
+  border-left: 4px solid #10b981;
+}
+
+.card-outflow {
+  border-left: 4px solid #f43f5e;
+}
+
+.card-gateway {
+  border-left: 4px solid #38bdf8;
 }
 
 .card-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.metric-label {
+  font-size: 13px;
+  font-weight: 600;
   color: #94a3b8;
 }
 
 .metric-tag {
-  background-color: #1e293b;
+  font-size: 11px;
   padding: 2px 6px;
   border-radius: 4px;
-  font-size: 11px;
-}
-
-.metric-main {
-  margin-top: 10px;
+  background-color: #1e293b;
+  color: #64748b;
 }
 
 .metric-value {
   font-size: 26px;
-  font-weight: 800;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 700;
+  font-family: monospace;
+}
+
+.text-emerald {
+  color: #10b981;
+}
+
+.text-rose {
+  color: #f43f5e;
+}
+
+.text-sky {
+  color: #38bdf8;
 }
 
 .metric-total {
@@ -479,16 +776,30 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   font-size: 12px;
-  margin-top: 4px;
   color: #94a3b8;
+  margin-top: 4px;
 }
 
-/* 实时图表面板 */
+.upstream-tag {
+  background-color: #1e293b;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: #38bdf8;
+  transition: all 0.2s;
+}
+
+.upstream-tag:hover {
+  background-color: #334155;
+  color: #ffffff;
+}
+
+/* 折线图 */
 .chart-panel {
-  background-color: #131d33;
-  border: 1px solid #1e293b;
-  border-radius: 12px;
-  padding: 12px 16px;
+  background-color: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 10px;
+  padding: 12px 18px;
 }
 
 .panel-header {
@@ -501,17 +812,17 @@ onMounted(() => {
 .panel-title {
   font-size: 13px;
   font-weight: 600;
-  color: #cbd5e1;
+  color: #e2e8f0;
 }
 
 .chart-legend {
   display: flex;
-  gap: 12px;
-  font-size: 11px;
+  gap: 14px;
+  font-size: 12px;
 }
 
 .chart-wrapper {
-  height: 85px;
+  height: 60px;
   width: 100%;
 }
 
@@ -520,7 +831,7 @@ onMounted(() => {
   height: 100%;
 }
 
-/* 防护标志栏 */
+/* 防护指示标 */
 .security-badges-bar {
   display: flex;
   flex-wrap: wrap;
@@ -531,78 +842,142 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
+  padding: 5px 10px;
   border-radius: 6px;
   font-size: 11px;
-  border: 1px solid #1e293b;
-  background-color: #0f172a;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.badge-item:hover {
+  transform: translateY(-1px);
 }
 
 .badge-on {
-  color: #38bdf8;
-  border-color: rgba(56, 189, 248, 0.3);
-}
-
-.badge-on .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background-color: #38bdf8;
-  box-shadow: 0 0 6px #38bdf8;
+  background-color: rgba(16, 185, 129, 0.1);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.25);
 }
 
 .badge-off {
+  background-color: rgba(71, 85, 105, 0.15);
   color: #64748b;
+  border: 1px solid rgba(71, 85, 105, 0.2);
 }
 
-.badge-off .dot {
+.dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background-color: #64748b;
+  background-color: currentColor;
 }
 
-/* 连接日志表格 */
+/* 审计列表 */
 .connections-table-card {
   flex: 1;
-  background-color: #131d33;
-  border: 1px solid #1e293b;
-  border-radius: 12px;
-  padding: 12px 16px;
+  background-color: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 10px;
+  padding: 12px 18px;
   display: flex;
   flex-direction: column;
-  min-height: 160px;
+  min-height: 180px;
 }
 
-.badge-count {
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.filter-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.tab-btn {
+  background-color: #1e293b;
+  border: 1px solid #334155;
+  color: #94a3b8;
+  padding: 4px 10px;
+  border-radius: 4px;
   font-size: 11px;
-  color: #64748b;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.tab-btn:hover {
+  background-color: #334155;
+  color: #ffffff;
+}
+
+.tab-btn.active {
+  background-color: #2563eb;
+  border-color: #2563eb;
+  color: #ffffff;
+}
+
+.tab-btn.tab-claude.active {
+  background-color: #7c3aed;
+  border-color: #7c3aed;
+}
+
+.clear-btn {
+  background-color: transparent;
+  border: 1px solid #334155;
+  color: #94a3b8;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.clear-btn:hover {
+  background-color: #ef4444;
+  border-color: #ef4444;
+  color: #ffffff;
 }
 
 .table-container {
   flex: 1;
   overflow-y: auto;
-  margin-top: 6px;
+  margin-top: 8px;
 }
 
 .audit-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 12px;
-  text-align: left;
 }
 
 .audit-table th {
-  padding: 8px;
-  color: #94a3b8;
+  text-align: left;
+  padding: 6px 10px;
+  color: #64748b;
   border-bottom: 1px solid #1e293b;
   font-weight: 500;
 }
 
 .audit-table td {
-  padding: 8px;
-  border-bottom: 1px solid #0f172a;
-  color: #e2e8f0;
+  padding: 6px 10px;
+  border-bottom: 1px solid #111e32;
+  color: #cbd5e1;
+}
+
+.row-claude {
+  background-color: rgba(124, 58, 237, 0.08);
+}
+
+.claude-badge {
+  background-color: #7c3aed;
+  color: white;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-right: 6px;
+  font-weight: 600;
 }
 
 .col-time {
@@ -611,8 +986,11 @@ onMounted(() => {
 }
 
 .col-host {
-  font-weight: 600;
-  color: #f8fafc;
+  font-weight: 500;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .method-tag {
@@ -620,6 +998,7 @@ onMounted(() => {
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 10px;
+  color: #94a3b8;
   font-family: monospace;
 }
 
@@ -627,53 +1006,212 @@ onMounted(() => {
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 10px;
+  font-weight: 600;
 }
 
 .tag-active {
-  background-color: rgba(56, 189, 248, 0.2);
+  background-color: rgba(56, 189, 248, 0.15);
   color: #38bdf8;
 }
 
 .tag-closed {
   background-color: rgba(148, 163, 184, 0.1);
-  color: #94a3b8;
+  color: #64748b;
 }
 
 .tag-blocked {
-  background-color: rgba(244, 63, 94, 0.2);
-  color: #f43f5e;
+  background-color: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
 }
 
 .empty-state {
   text-align: center;
-  color: #64748b;
-  padding: 24px 0;
+  padding: 30px;
+  color: #475569;
 }
 
-/* 颜色工具 */
-.text-emerald { color: #10b981; }
-.text-rose { color: #f43f5e; }
-.text-sky { color: #38bdf8; }
-.font-mono { font-family: ui-monospace, monospace; }
-
-/* 底部状态条 */
+/* 底部状态 */
 .app-footer {
   display: flex;
   justify-content: space-between;
-  padding: 6px 24px;
-  background-color: #0f172a;
+  padding: 6px 20px;
+  background-color: #0b0f19;
   border-top: 1px solid #1e293b;
   font-size: 11px;
   color: #64748b;
 }
 
+/* 弹窗 Modal */
+.modal-backdrop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-content {
+  background-color: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  width: 580px;
+  max-width: 90vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 20px;
+  border-bottom: 1px solid #1e293b;
+}
+
+.modal-title-area h3 {
+  margin: 0;
+  font-size: 15px;
+  color: #ffffff;
+}
+
+.modal-grade {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.grade-perfect {
+  background-color: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+}
+
+.grade-good {
+  background-color: rgba(234, 179, 8, 0.15);
+  color: #eab308;
+}
+
+.close-btn {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  font-size: 18px;
+  cursor: pointer;
+}
+
+.modal-body {
+  padding: 14px 20px;
+  overflow-y: auto;
+  max-height: 480px;
+}
+
+.modal-loading {
+  text-align: center;
+  padding: 30px;
+  color: #38bdf8;
+  font-size: 13px;
+}
+
+.check-items-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.check-item-row {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background-color: #1e293b;
+  border: 1px solid #334155;
+}
+
+.check-pass {
+  border-left: 3px solid #10b981;
+}
+
+.check-fail {
+  border-left: 3px solid #eab308;
+}
+
+.check-icon {
+  font-size: 16px;
+  margin-right: 12px;
+}
+
+.check-info {
+  flex: 1;
+}
+
+.check-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.check-desc {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 2px;
+}
+
+.check-status-tag {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background-color: rgba(15, 23, 42, 0.6);
+  color: #cbd5e1;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 20px;
+  border-top: 1px solid #1e293b;
+  background-color: #0b0f19;
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
+}
+
+.modal-action-btn {
+  background-color: #2563eb;
+  color: white;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.modal-close-btn {
+  background-color: #334155;
+  color: white;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .spinner {
   display: inline-block;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border: 2px solid rgba(255, 255, 255, 0.3);
-  border-top-color: #ffffff;
   border-radius: 50%;
+  border-top-color: white;
   animation: spin 0.8s linear infinite;
 }
 
