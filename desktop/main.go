@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"os"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -37,6 +38,7 @@ func main() {
 	})
 
 	if err != nil {
+		_ = os.WriteFile("error.log", []byte(err.Error()), 0644)
 		println("Error:", err.Error())
 	}
 }

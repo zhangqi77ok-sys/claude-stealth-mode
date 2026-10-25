@@ -1,12 +1,17 @@
 @echo off
-chcp 65001 >nul
-title Claude Stealth Guardian
+cd /d "%~dp0"
 
-if exist "%~dp0ClaudeStealthGuardian.exe" (
-    start "" "%~dp0ClaudeStealthGuardian.exe"
-) else if exist "%~dp0desktop\bin\ClaudeStealthGuardian.exe" (
-    start "" "%~dp0desktop\bin\ClaudeStealthGuardian.exe"
-) else (
-    echo [错误] 未找到 ClaudeStealthGuardian.exe，请先编译。
-    pause
-)
+if exist "ClaudeStealthGuardian.exe" goto RUN_ROOT
+if exist "desktop\bin\ClaudeStealthGuardian.exe" goto RUN_BIN
+
+echo [!] ClaudeStealthGuardian.exe not found.
+pause
+exit /b
+
+:RUN_ROOT
+start "" "ClaudeStealthGuardian.exe"
+exit /b
+
+:RUN_BIN
+start "" "desktop\bin\ClaudeStealthGuardian.exe"
+exit /b
