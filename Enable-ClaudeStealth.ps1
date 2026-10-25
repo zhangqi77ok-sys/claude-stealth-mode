@@ -79,9 +79,11 @@ Write-Host "  ✅ 命令行与子进程代理已生效 (HTTP_PROXY / HTTPS_PROXY
 # 2. 切换系统时区为美国太平洋时间，并锁定
 # -------------------------------------------------------------------------
 Write-Host "`n[2/6] 正在修改系统时区为 [$Timezone]..." -ForegroundColor Yellow
+Set-Service -Name tzautoupdate -StartupType Disabled
+Stop-Service -Name tzautoupdate -Force
 tzutil /s $Timezone
 Set-WinHomeLocation -GeoId 244
-Write-Host "  ✅ Windows 归属区域已自动设为: 美国 (GeoID 244)" -ForegroundColor Green
+Write-Host "  ✅ Windows 自动时区更新已禁用，归属区域已设为: 美国 (GeoID 244)" -ForegroundColor Green
 $currentTz = tzutil /g
 Write-Host "  ✅ 当前系统时区已切换为: $currentTz" -ForegroundColor Green
 
