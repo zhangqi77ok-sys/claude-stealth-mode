@@ -6,6 +6,14 @@ export function ClearTrafficLogs() {
   return window['go']['main']['App']['ClearTrafficLogs']();
 }
 
+export function DismissRiskAlert() {
+  return window['go']['main']['App']['DismissRiskAlert']();
+}
+
+export function GetAutoStart() {
+  return window['go']['main']['App']['GetAutoStart']();
+}
+
 export function GetStatus() {
   return window['go']['main']['App']['GetStatus']();
 }
@@ -26,6 +34,14 @@ export function TestNodeLatency() {
   return window['go']['main']['App']['TestNodeLatency']();
 }
 
+export function ToggleAutoStart(arg1) {
+  return window['go']['main']['App']['ToggleAutoStart'](arg1);
+}
+
 export function ToggleStealth(arg1) {
   return window['go']['main']['App']['ToggleStealth'](arg1);
+}
+
+export function WipeClaudeDeviceFingerprint() {
+  return window['go']['main']['App']['WipeClaudeDeviceFingerprint']();
 }

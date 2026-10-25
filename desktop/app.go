@@ -188,12 +188,13 @@ func (a *App) GetStatus() map[string]interface{} {
 	hasSmhnr := strings.Contains(outputStr, "智能多宿主名称解析 (SMHNR) 已禁用")
 
 	return map[string]interface{}{
-		"isProtected":   isProtected,
-		"hasWebRtc":     hasWebRtc,
-		"hasV6Block":    hasV6Block,
-		"hasSmhnr":      hasSmhnr,
-		"upstreamPort":  a.upstreamPort,
-		"rawReport":     outputStr,
+		"isProtected":  isProtected,
+		"hasWebRtc":    hasWebRtc,
+		"hasV6Block":   hasV6Block,
+		"hasSmhnr":     hasSmhnr,
+		"upstreamPort": a.upstreamPort,
+		"isAutoStart":  a.GetAutoStart(),
+		"rawReport":    outputStr,
 	}
 }
 
@@ -207,6 +208,12 @@ func (a *App) GetTrafficNow() map[string]interface{} {
 // ClearTrafficLogs 清空网关历史日志
 func (a *App) ClearTrafficLogs() bool {
 	a.gateway.ClearLogs()
+	return true
+}
+
+// DismissRiskAlert 忽略当前风控警报
+func (a *App) DismissRiskAlert() bool {
+	a.gateway.DismissRiskAlert()
 	return true
 }
 
@@ -267,6 +274,73 @@ func (a *App) TestNodeLatency() map[string]interface{} {
 		"loc":     loc,
 		"isUS":    loc == "US",
 	}
+}
+
+// WipeClaudeDeviceFingerprint 彻底抹除 Claude 设备硬件指纹 (ant-did)、沙箱缓存与残留
+func (a *App) WipeClaudeDeviceFingerprint() map[string]interface{} {
+	_ = exec.Command("taskkill", "/F", "/IM", "claude.exe").Run()
+
+	localAppData := os.Getenv("LOCALAPPDATA")
+
+	// 清理 WindowsApps 商店版硬件指纹与沙箱
+	storeCache := filepath.Join(localAppData, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache")
+	if _, err := os.Stat(storeCache); err == nil {
+		_ = os.RemoveAll(storeCache)
+	}
+
+	// 清理独立安装版 LocalAppData
+	userClaude := filepath.Join(localAppData, "Claude")
+	if _, err := os.Stat(userClaude); err == nil {
+		_ = os.RemoveAll(filepath.Join(userClaude, "Cache"))
+		_ = os.RemoveAll(filepath.Join(userClaude, "Code Cache"))
+		_ = os.RemoveAll(filepath.Join(userClaude, "Session Storage"))
+		_ = os.Remove(filepath.Join(userClaude, "ant-device-registry.json"))
+	}
+
+	// 清理 Temp 中的临时会话
+	tempDir := os.Getenv("TEMP")
+	entries, _ := os.ReadDir(tempDir)
+	for _, e := range entries {
+		if strings.Contains(strings.ToLower(e.Name()), "claude") {
+			_ = os.RemoveAll(filepath.Join(tempDir, e.Name()))
+		}
+	}
+
+	return map[string]interface{}{
+		"success": true,
+		"message": "已彻底粉碎 Claude 硬件指纹 (ant-did)、沙箱缓存与残留记录！",
+	}
+}
+
+// ToggleAutoStart 开关开机自启
+func (a *App) ToggleAutoStart(enable bool) bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+
+	if enable {
+		if exe, err := os.Executable(); err == nil {
+			_ = k.SetStringValue("ClaudeStealthGuardian", exe)
+			return true
+		}
+	} else {
+		_ = k.DeleteValue("ClaudeStealthGuardian")
+		return false
+	}
+	return false
+}
+
+// GetAutoStart 获取当前是否设置了开机自启
+func (a *App) GetAutoStart() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	_, _, err = k.GetStringValue("ClaudeStealthGuardian")
+	return err == nil
 }
 
 // RunFullCheck 运行完整 10 项健康体检并返回结构化报告数据

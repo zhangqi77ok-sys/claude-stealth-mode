@@ -26,6 +26,14 @@ type ConnectionLog struct {
 	StartTime time.Time `json:"-"`
 }
 
+// RiskAlert 代表捕获到的 Cloudflare 挑战或封锁告警
+type RiskAlert struct {
+	Time   string `json:"time"`
+	Host   string `json:"host"`
+	Reason string `json:"reason"`
+	Status int    `json:"status"`
+}
+
 func isClaudeHost(host string) bool {
 	h := strings.ToLower(host)
 	return strings.Contains(h, "claude.ai") ||
@@ -40,17 +48,20 @@ type Gateway struct {
 	server        *http.Server
 	listener      net.Listener
 
-	totalIn  uint64
-	totalOut uint64
-	speedIn  uint64
-	speedOut uint64
+	totalIn   uint64
+	totalOut  uint64
+	claudeIn  uint64
+	claudeOut uint64
+	speedIn   uint64
+	speedOut  uint64
 
 	lastIn     uint64
 	lastOut    uint64
 	activeConn int32
 
-	logsLock sync.RWMutex
-	logs     []*ConnectionLog
+	logsLock  sync.RWMutex
+	logs      []*ConnectionLog
+	riskAlert *RiskAlert
 
 	isRunning bool
 	stopChan  chan struct{}
@@ -105,6 +116,23 @@ func (g *Gateway) ClearLogs() {
 	g.logs = make([]*ConnectionLog, 0, 100)
 }
 
+func (g *Gateway) triggerRiskAlert(host string, status int, reason string) {
+	g.logsLock.Lock()
+	defer g.logsLock.Unlock()
+	g.riskAlert = &RiskAlert{
+		Time:   time.Now().Format("15:04:05"),
+		Host:   host,
+		Status: status,
+		Reason: reason,
+	}
+}
+
+func (g *Gateway) DismissRiskAlert() {
+	g.logsLock.Lock()
+	defer g.logsLock.Unlock()
+	g.riskAlert = nil
+}
+
 func (g *Gateway) SetUpstream(proxyURL string) {
 	g.logsLock.Lock()
 	defer g.logsLock.Unlock()
@@ -152,6 +180,7 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt32(&g.activeConn, 1)
 	defer atomic.AddInt32(&g.activeConn, -1)
 
+	isClaude := isClaudeHost(r.Host)
 	startTime := time.Now()
 	connLog := &ConnectionLog{
 		ID:        fmt.Sprintf("%d", startTime.UnixNano()),
@@ -159,7 +188,7 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		Host:      r.Host,
 		Method:    "CONNECT",
 		Status:    "Active",
-		IsClaude:  isClaudeHost(r.Host),
+		IsClaude:  isClaude,
 		StartTime: startTime,
 	}
 	g.addLog(connLog)
@@ -182,6 +211,9 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 					br := bufio.NewReader(upstreamConn)
 					resp, respErr := http.ReadResponse(br, r)
 					if respErr != nil || resp.StatusCode != http.StatusOK {
+						if resp != nil && (resp.StatusCode == 403 || resp.StatusCode == 429) {
+							g.triggerRiskAlert(r.Host, resp.StatusCode, "上游代理节点返回 403/429 访问拒绝，建议切换干净节点")
+						}
 						upstreamConn.Close()
 						err = fmt.Errorf("upstream proxy error")
 					}
@@ -230,6 +262,9 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			if n > 0 {
 				atomic.AddUint64(&g.totalOut, uint64(n))
 				atomic.AddUint64(&connLog.BytesOut, uint64(n))
+				if isClaude {
+					atomic.AddUint64(&g.claudeOut, uint64(n))
+				}
 				_, wErr := upstreamConn.Write(buf[:n])
 				if wErr != nil {
 					break
@@ -250,6 +285,9 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			if n > 0 {
 				atomic.AddUint64(&g.totalIn, uint64(n))
 				atomic.AddUint64(&connLog.BytesIn, uint64(n))
+				if isClaude {
+					atomic.AddUint64(&g.claudeIn, uint64(n))
+				}
 				_, wErr := clientConn.Write(buf[:n])
 				if wErr != nil {
 					break
@@ -271,6 +309,7 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt32(&g.activeConn, 1)
 	defer atomic.AddInt32(&g.activeConn, -1)
 
+	isClaude := isClaudeHost(r.URL.Host)
 	startTime := time.Now()
 	connLog := &ConnectionLog{
 		ID:        fmt.Sprintf("%d", startTime.UnixNano()),
@@ -278,7 +317,7 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 		Host:      r.URL.Host,
 		Method:    r.Method,
 		Status:    "Active",
-		IsClaude:  isClaudeHost(r.URL.Host),
+		IsClaude:  isClaude,
 		StartTime: startTime,
 	}
 	g.addLog(connLog)
@@ -312,6 +351,10 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == 403 || resp.StatusCode == 429 || strings.EqualFold(resp.Header.Get("Cf-Mitigated"), "challenge") {
+		g.triggerRiskAlert(r.URL.Host, resp.StatusCode, "捕获到 Cloudflare 访问挑战/拦截 (403/429/Challenge)")
+	}
+
 	// 拷贝响应头与状态码
 	for k, vv := range resp.Header {
 		for _, v := range vv {
@@ -327,6 +370,9 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 		if n > 0 {
 			atomic.AddUint64(&g.totalIn, uint64(n))
 			atomic.AddUint64(&connLog.BytesIn, uint64(n))
+			if isClaude {
+				atomic.AddUint64(&g.claudeIn, uint64(n))
+			}
 			_, _ = w.Write(buf[:n])
 		}
 		if rErr != nil {
@@ -359,8 +405,11 @@ func (g *Gateway) GetStats() map[string]interface{} {
 		"speedOut":      atomic.LoadUint64(&g.speedOut),
 		"totalIn":       atomic.LoadUint64(&g.totalIn),
 		"totalOut":      atomic.LoadUint64(&g.totalOut),
+		"claudeIn":      atomic.LoadUint64(&g.claudeIn),
+		"claudeOut":     atomic.LoadUint64(&g.claudeOut),
 		"activeConns":   atomic.LoadInt32(&g.activeConn),
 		"upstreamProxy": g.upstreamProxy,
+		"riskAlert":     g.riskAlert,
 		"logs":          recentLogs,
 	}
 }

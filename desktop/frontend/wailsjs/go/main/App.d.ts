@@ -3,6 +3,10 @@
 
 export function ClearTrafficLogs():Promise<boolean>;
 
+export function DismissRiskAlert():Promise<boolean>;
+
+export function GetAutoStart():Promise<boolean>;
+
 export function GetStatus():Promise<any>;
 
 export function GetTrafficNow():Promise<any>;
@@ -13,4 +17,8 @@ export function SetUpstreamPort(arg1:string):Promise<string>;
 
 export function TestNodeLatency():Promise<any>;
 
+export function ToggleAutoStart(arg1:boolean):Promise<boolean>;
+
 export function ToggleStealth(arg1:boolean):Promise<string>;
+
+export function WipeClaudeDeviceFingerprint():Promise<any>;

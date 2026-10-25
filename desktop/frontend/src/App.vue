@@ -8,7 +8,11 @@ import {
   SetUpstreamPort, 
   ClearTrafficLogs, 
   TestNodeLatency, 
-  RunFullCheck 
+  RunFullCheck,
+  WipeClaudeDeviceFingerprint,
+  DismissRiskAlert,
+  ToggleAutoStart,
+  GetAutoStart
 } from '../wailsjs/go/main/App'
 
 // 状态数据
@@ -16,14 +20,18 @@ const isProtected = ref(false)
 const isLoading = ref(false)
 const statusMessage = ref('安全网关正在监听 127.0.0.1:8999')
 const upstreamPort = ref('7897')
+const isAutoStart = ref(false)
 
 // 流量监控数据
 const speedIn = ref(0)
 const speedOut = ref(0)
 const totalIn = ref(0)
 const totalOut = ref(0)
+const claudeIn = ref(0)
+const claudeOut = ref(0)
 const activeConns = ref(0)
 const connectionLogs = ref([])
+const riskAlert = ref(null)
 
 // 节点出口探测
 const nodeInfo = ref({
@@ -48,6 +56,15 @@ const filteredLogs = computed(() => {
 
 const claudeLogCount = computed(() => connectionLogs.value.filter(l => l.isClaude).length)
 const activeLogCount = computed(() => connectionLogs.value.filter(l => l.status === 'Active').length)
+
+// 计算 Claude 流量与总流量占比
+const claudeTotalBytes = computed(() => claudeIn.value + claudeOut.value)
+const claudeSharePercent = computed(() => {
+  const allTotal = totalIn.value + totalOut.value
+  if (allTotal <= 0) return 0
+  const pct = Math.round((claudeTotalBytes.value / allTotal) * 100)
+  return Math.min(100, Math.max(0, pct))
+})
 
 // 10项体检弹窗
 const showCheckModal = ref(false)
@@ -132,6 +149,32 @@ async function handleClearLogs() {
   statusMessage.value = '已清空本地连接审计日志'
 }
 
+// 一键抹除硬件指纹
+async function wipeFingerprint() {
+  const confirmed = window.confirm('确定要深度抹除 Claude 本地设备指纹 (ant-did)、沙箱缓存与残留吗？\n\n这将关闭正在运行的 Claude 桌面端，彻底粉碎硬件识别标记，让电脑恢复为全新干净设备状态。')
+  if (!confirmed) return
+  try {
+    const res = await WipeClaudeDeviceFingerprint()
+    alert(res.message || '重置完成！')
+    statusMessage.value = '已彻底清除旧硬件指纹 ant-did 与沙箱缓存'
+  } catch (err) {
+    alert('重置异常: ' + (err?.message || err))
+  }
+}
+
+// 忽略风控告警
+async function dismissRisk() {
+  await DismissRiskAlert()
+  riskAlert.value = null
+}
+
+// 切换开机自启
+async function toggleAutoStart() {
+  const target = !isAutoStart.value
+  isAutoStart.value = await ToggleAutoStart(target)
+  statusMessage.value = isAutoStart.value ? '已开启 Windows 开机自启动' : '已关闭开机自启'
+}
+
 // 运行完整 10 项健康体检
 async function runHealthCheck() {
   showCheckModal.value = true
@@ -155,7 +198,9 @@ async function refreshStatus() {
     if (res) {
       isProtected.value = res.isProtected
       if (res.upstreamPort) upstreamPort.value = res.upstreamPort
+      if (res.isAutoStart !== undefined) isAutoStart.value = res.isAutoStart
     }
+    isAutoStart.value = await GetAutoStart()
   } catch {}
 }
 
@@ -165,8 +210,11 @@ function handleTrafficUpdate(data) {
   speedOut.value = data.speedOut || 0
   totalIn.value = data.totalIn || 0
   totalOut.value = data.totalOut || 0
+  claudeIn.value = data.claudeIn || 0
+  claudeOut.value = data.claudeOut || 0
   activeConns.value = data.activeConns || 0
   if (data.upstreamPort) upstreamPort.value = data.upstreamPort
+  if (data.riskAlert) riskAlert.value = data.riskAlert
 
   if (data.logs && Array.isArray(data.logs)) {
     connectionLogs.value = data.logs.slice().reverse()
@@ -247,6 +295,9 @@ onMounted(() => {
       </div>
 
       <div class="header-right">
+        <button class="action-top-btn" @click="wipeFingerprint" title="彻底清除旧硬件指纹 ant-did 与沙箱残留">
+          🧹 重置指纹
+        </button>
         <button class="health-check-btn" @click="runHealthCheck">
           🩺 10项体检
         </button>
@@ -265,14 +316,25 @@ onMounted(() => {
       </div>
     </header>
 
+    <!-- Cloudflare 拦截风控告警条 -->
+    <div v-if="riskAlert" class="risk-alert-banner">
+      <div class="risk-alert-left">
+        <span class="risk-icon">⚠️</span>
+        <div class="risk-msg">
+          <strong>【风控预警】检测到节点异常拦截</strong>：目标 <code>{{ riskAlert.host }}</code> 响应状态码 <code>{{ riskAlert.status }}</code>（{{ riskAlert.reason }}）。建议立即在代理软件中切换干净节点，谨防关联封号！
+        </div>
+      </div>
+      <button class="dismiss-risk-btn" @click="dismissRisk">✕ 知道了</button>
+    </div>
+
     <!-- 主仪表盘内容 -->
     <main class="dashboard-content">
-      <!-- 流量监控大卡片 (流入 / 流出 / 网关) -->
+      <!-- 流量监控大卡片 (流入 / 流出 / Claude 专线 / 网关) -->
       <section class="traffic-metrics-row">
         <!-- 流入卡片 -->
         <div class="metric-card card-inflow">
           <div class="card-header">
-            <span class="metric-label">🟢 数据流入 (Inflow / 接收)</span>
+            <span class="metric-label">🟢 数据流入 (接收)</span>
             <span class="metric-tag">实时带宽</span>
           </div>
           <div class="metric-main">
@@ -288,7 +350,7 @@ onMounted(() => {
         <!-- 流出卡片 -->
         <div class="metric-card card-outflow">
           <div class="card-header">
-            <span class="metric-label">🔴 数据流出 (Outflow / 发送)</span>
+            <span class="metric-label">🔴 数据流出 (发送)</span>
             <span class="metric-tag">实时带宽</span>
           </div>
           <div class="metric-main">
@@ -297,6 +359,26 @@ onMounted(() => {
             </div>
             <div class="metric-total">
               累计流出: <strong>{{ formatBytes(totalOut) }}</strong>
+            </div>
+          </div>
+        </div>
+
+        <!-- Claude 专线流量独立统计卡片 -->
+        <div class="metric-card card-claude">
+          <div class="card-header">
+            <span class="metric-label">🟣 Claude 专线消耗</span>
+            <span class="metric-tag tag-purple">占比 {{ claudeSharePercent }}%</span>
+          </div>
+          <div class="metric-main">
+            <div class="metric-value text-purple">
+              {{ formatBytes(claudeTotalBytes) }}
+            </div>
+            <div class="metric-total">
+              接收: <strong>{{ formatBytes(claudeIn) }}</strong> · 发送: <strong>{{ formatBytes(claudeOut) }}</strong>
+            </div>
+            <!-- 占比进度条 -->
+            <div class="claude-bar-track">
+              <div class="claude-bar-fill" :style="{ width: claudeSharePercent + '%' }"></div>
             </div>
           </div>
         </div>
@@ -320,7 +402,7 @@ onMounted(() => {
             </div>
             <div class="gateway-info-row">
               <span>协议过滤:</span>
-              <span class="text-emerald">Accept-Language 自动脱敏</span>
+              <span class="text-emerald">Accept-Language 脱敏</span>
             </div>
           </div>
         </div>
@@ -457,8 +539,17 @@ onMounted(() => {
 
     <!-- 底部状态条 -->
     <footer class="app-footer">
-      <span>{{ statusMessage }}</span>
-      <span>Claude Stealth Mode · 零泄露工业级架构</span>
+      <div class="footer-left">
+        <span class="status-dot-inline" :class="isProtected ? 'dot-green' : 'dot-yellow'"></span>
+        <span>{{ statusMessage }}</span>
+      </div>
+      <div class="footer-right">
+        <button class="autostart-btn" @click="toggleAutoStart">
+          🚀 开机自启: {{ isAutoStart ? '已开启' : '未开启' }}
+        </button>
+        <span class="divider">|</span>
+        <span>Claude Stealth Mode · 零泄露工业级架构</span>
+      </div>
     </footer>
 
     <!-- 10 项防护指标健康体检弹窗 (Modal) -->
@@ -530,33 +621,33 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 24px;
+  padding: 10px 20px;
   background-color: #0f172a;
   border-bottom: 1px solid #1e293b;
-  gap: 16px;
+  gap: 12px;
 }
 
 .logo-area {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
 .shield-icon {
-  font-size: 26px;
+  font-size: 24px;
 }
 
 .title {
   margin: 0;
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 700;
   letter-spacing: -0.02em;
   color: #ffffff;
 }
 
 .subtitle {
-  margin: 2px 0 0 0;
-  font-size: 11px;
+  margin: 1px 0 0 0;
+  font-size: 10px;
   color: #64748b;
 }
 
@@ -567,7 +658,7 @@ onMounted(() => {
   gap: 8px;
   background-color: rgba(30, 41, 59, 0.7);
   border: 1px solid #334155;
-  padding: 4px 12px;
+  padding: 4px 10px;
   border-radius: 20px;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -579,9 +670,17 @@ onMounted(() => {
 }
 
 .status-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
+}
+
+.status-dot-inline {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 6px;
 }
 
 .dot-green {
@@ -595,7 +694,7 @@ onMounted(() => {
 }
 
 .node-info-text {
-  font-size: 12px;
+  font-size: 11px;
   color: #cbd5e1;
   font-family: monospace;
 }
@@ -604,7 +703,7 @@ onMounted(() => {
   background: transparent;
   border: none;
   color: #38bdf8;
-  font-size: 11px;
+  font-size: 10px;
   cursor: pointer;
   padding: 0 2px;
 }
@@ -612,16 +711,34 @@ onMounted(() => {
 .header-right {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
+}
+
+.action-top-btn {
+  background-color: rgba(30, 41, 59, 0.8);
+  border: 1px solid #334155;
+  color: #a78bfa;
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.action-top-btn:hover {
+  background-color: #7c3aed;
+  color: white;
+  border-color: #7c3aed;
 }
 
 .health-check-btn {
   background-color: rgba(30, 41, 59, 0.8);
   border: 1px solid #334155;
   color: #38bdf8;
-  padding: 6px 14px;
+  padding: 5px 12px;
   border-radius: 6px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
@@ -633,9 +750,9 @@ onMounted(() => {
 }
 
 .status-badge {
-  padding: 6px 14px;
+  padding: 5px 12px;
   border-radius: 20px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
 }
 
@@ -654,11 +771,11 @@ onMounted(() => {
 .toggle-btn {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 18px;
+  gap: 6px;
+  padding: 6px 16px;
   border-radius: 6px;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 12px;
   border: none;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -687,65 +804,124 @@ onMounted(() => {
   cursor: not-allowed;
 }
 
+/* 风控警报横幅 */
+.risk-alert-banner {
+  background: linear-gradient(90deg, #7f1d1d, #991b1b);
+  border-bottom: 1px solid #ef4444;
+  color: #fee2e2;
+  padding: 6px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  animation: slideDown 0.3s ease;
+}
+
+.risk-alert-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.risk-icon {
+  font-size: 14px;
+}
+
+.risk-msg code {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: #fef08a;
+}
+
+.dismiss-risk-btn {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: white;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.dismiss-risk-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+@keyframes slideDown {
+  from { transform: translateY(-100%); }
+  to { transform: translateY(0); }
+}
+
 /* 主内容区 */
 .dashboard-content {
   flex: 1;
-  padding: 16px 24px;
+  padding: 12px 20px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
   overflow-y: auto;
 }
 
-/* 流量卡片 */
+/* 4格流量卡片 */
 .traffic-metrics-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.1fr;
-  gap: 14px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
 }
 
 .metric-card {
   background-color: #111827;
   border: 1px solid #1f2937;
-  border-radius: 10px;
-  padding: 14px 18px;
+  border-radius: 8px;
+  padding: 10px 14px;
+  position: relative;
 }
 
 .card-inflow {
-  border-left: 4px solid #10b981;
+  border-left: 3px solid #10b981;
 }
 
 .card-outflow {
-  border-left: 4px solid #f43f5e;
+  border-left: 3px solid #f43f5e;
+}
+
+.card-claude {
+  border-left: 3px solid #a855f7;
 }
 
 .card-gateway {
-  border-left: 4px solid #38bdf8;
+  border-left: 3px solid #38bdf8;
 }
 
 .card-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .metric-label {
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 600;
   color: #94a3b8;
 }
 
 .metric-tag {
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 4px;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
   background-color: #1e293b;
   color: #64748b;
 }
 
+.tag-purple {
+  background-color: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+}
+
 .metric-value {
-  font-size: 26px;
+  font-size: 20px;
   font-weight: 700;
   font-family: monospace;
 }
@@ -758,13 +934,17 @@ onMounted(() => {
   color: #f43f5e;
 }
 
+.text-purple {
+  color: #c084fc;
+}
+
 .text-sky {
   color: #38bdf8;
 }
 
 .metric-total {
-  margin-top: 4px;
-  font-size: 12px;
+  margin-top: 3px;
+  font-size: 11px;
   color: #64748b;
 }
 
@@ -772,18 +952,33 @@ onMounted(() => {
   color: #cbd5e1;
 }
 
+.claude-bar-track {
+  width: 100%;
+  height: 4px;
+  background-color: #1e293b;
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+
+.claude-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #9333ea, #a855f7);
+  transition: width 0.3s ease;
+}
+
 .gateway-info-row {
   display: flex;
   justify-content: space-between;
-  font-size: 12px;
+  font-size: 11px;
   color: #94a3b8;
-  margin-top: 4px;
+  margin-top: 3px;
 }
 
 .upstream-tag {
   background-color: #1e293b;
-  padding: 2px 6px;
-  border-radius: 4px;
+  padding: 1px 5px;
+  border-radius: 3px;
   cursor: pointer;
   color: #38bdf8;
   transition: all 0.2s;
@@ -798,31 +993,31 @@ onMounted(() => {
 .chart-panel {
   background-color: #111827;
   border: 1px solid #1f2937;
-  border-radius: 10px;
-  padding: 12px 18px;
+  border-radius: 8px;
+  padding: 10px 14px;
 }
 
 .panel-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .panel-title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   color: #e2e8f0;
 }
 
 .chart-legend {
   display: flex;
-  gap: 14px;
-  font-size: 12px;
+  gap: 12px;
+  font-size: 11px;
 }
 
 .chart-wrapper {
-  height: 60px;
+  height: 52px;
   width: 100%;
 }
 
@@ -835,16 +1030,16 @@ onMounted(() => {
 .security-badges-bar {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
 }
 
 .badge-item {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  border-radius: 6px;
-  font-size: 11px;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  font-size: 10px;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.2s;
@@ -867,8 +1062,8 @@ onMounted(() => {
 }
 
 .dot {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background-color: currentColor;
 }
@@ -878,31 +1073,31 @@ onMounted(() => {
   flex: 1;
   background-color: #111827;
   border: 1px solid #1f2937;
-  border-radius: 10px;
-  padding: 12px 18px;
+  border-radius: 8px;
+  padding: 10px 14px;
   display: flex;
   flex-direction: column;
-  min-height: 180px;
+  min-height: 160px;
 }
 
 .filter-group {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
 }
 
 .filter-tabs {
   display: flex;
-  gap: 6px;
+  gap: 5px;
 }
 
 .tab-btn {
   background-color: #1e293b;
   border: 1px solid #334155;
   color: #94a3b8;
-  padding: 4px 10px;
+  padding: 3px 8px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: 10px;
   cursor: pointer;
   transition: all 0.2s;
 }
@@ -927,9 +1122,9 @@ onMounted(() => {
   background-color: transparent;
   border: 1px solid #334155;
   color: #94a3b8;
-  padding: 4px 10px;
+  padding: 3px 8px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: 10px;
   cursor: pointer;
   transition: all 0.2s;
 }
@@ -943,25 +1138,25 @@ onMounted(() => {
 .table-container {
   flex: 1;
   overflow-y: auto;
-  margin-top: 8px;
+  margin-top: 6px;
 }
 
 .audit-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .audit-table th {
   text-align: left;
-  padding: 6px 10px;
+  padding: 5px 8px;
   color: #64748b;
   border-bottom: 1px solid #1e293b;
   font-weight: 500;
 }
 
 .audit-table td {
-  padding: 6px 10px;
+  padding: 5px 8px;
   border-bottom: 1px solid #111e32;
   color: #cbd5e1;
 }
@@ -973,10 +1168,10 @@ onMounted(() => {
 .claude-badge {
   background-color: #7c3aed;
   color: white;
-  font-size: 10px;
-  padding: 1px 5px;
+  font-size: 9px;
+  padding: 1px 4px;
   border-radius: 3px;
-  margin-right: 6px;
+  margin-right: 5px;
   font-weight: 600;
 }
 
@@ -987,7 +1182,7 @@ onMounted(() => {
 
 .col-host {
   font-weight: 500;
-  max-width: 280px;
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -995,17 +1190,17 @@ onMounted(() => {
 
 .method-tag {
   background-color: #1e293b;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9px;
   color: #94a3b8;
   font-family: monospace;
 }
 
 .status-tag {
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9px;
   font-weight: 600;
 }
 
@@ -1026,7 +1221,7 @@ onMounted(() => {
 
 .empty-state {
   text-align: center;
-  padding: 30px;
+  padding: 24px;
   color: #475569;
 }
 
@@ -1034,11 +1229,43 @@ onMounted(() => {
 .app-footer {
   display: flex;
   justify-content: space-between;
-  padding: 6px 20px;
+  align-items: center;
+  padding: 5px 18px;
   background-color: #0b0f19;
   border-top: 1px solid #1e293b;
   font-size: 11px;
   color: #64748b;
+}
+
+.footer-left {
+  display: flex;
+  align-items: center;
+}
+
+.footer-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.autostart-btn {
+  background: transparent;
+  border: 1px solid #334155;
+  color: #94a3b8;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.autostart-btn:hover {
+  background-color: #1e293b;
+  color: #38bdf8;
+}
+
+.divider {
+  color: #334155;
 }
 
 /* 弹窗 Modal */
@@ -1072,21 +1299,21 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 14px 20px;
+  padding: 12px 18px;
   border-bottom: 1px solid #1e293b;
 }
 
 .modal-title-area h3 {
   margin: 0;
-  font-size: 15px;
+  font-size: 14px;
   color: #ffffff;
 }
 
 .modal-grade {
   display: inline-block;
-  margin-top: 4px;
+  margin-top: 3px;
   font-size: 11px;
-  padding: 2px 8px;
+  padding: 2px 7px;
   border-radius: 4px;
   font-weight: 600;
 }
@@ -1105,33 +1332,33 @@ onMounted(() => {
   background: transparent;
   border: none;
   color: #94a3b8;
-  font-size: 18px;
+  font-size: 16px;
   cursor: pointer;
 }
 
 .modal-body {
-  padding: 14px 20px;
+  padding: 12px 18px;
   overflow-y: auto;
-  max-height: 480px;
+  max-height: 440px;
 }
 
 .modal-loading {
   text-align: center;
   padding: 30px;
   color: #38bdf8;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .check-items-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
 }
 
 .check-item-row {
   display: flex;
   align-items: center;
-  padding: 8px 12px;
+  padding: 7px 10px;
   border-radius: 6px;
   background-color: #1e293b;
   border: 1px solid #334155;
@@ -1146,8 +1373,8 @@ onMounted(() => {
 }
 
 .check-icon {
-  font-size: 16px;
-  margin-right: 12px;
+  font-size: 14px;
+  margin-right: 10px;
 }
 
 .check-info {
@@ -1155,21 +1382,21 @@ onMounted(() => {
 }
 
 .check-title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   color: #f1f5f9;
 }
 
 .check-desc {
-  font-size: 11px;
+  font-size: 10px;
   color: #94a3b8;
-  margin-top: 2px;
+  margin-top: 1px;
 }
 
 .check-status-tag {
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 4px;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
   background-color: rgba(15, 23, 42, 0.6);
   color: #cbd5e1;
 }
@@ -1177,8 +1404,8 @@ onMounted(() => {
 .modal-footer {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
-  padding: 12px 20px;
+  gap: 8px;
+  padding: 10px 18px;
   border-top: 1px solid #1e293b;
   background-color: #0b0f19;
   border-bottom-left-radius: 12px;
@@ -1189,9 +1416,9 @@ onMounted(() => {
   background-color: #2563eb;
   color: white;
   border: none;
-  padding: 6px 14px;
-  border-radius: 6px;
-  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 5px;
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -1199,16 +1426,16 @@ onMounted(() => {
   background-color: #334155;
   color: white;
   border: none;
-  padding: 6px 14px;
-  border-radius: 6px;
-  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 5px;
+  font-size: 11px;
   cursor: pointer;
 }
 
 .spinner {
   display: inline-block;
-  width: 12px;
-  height: 12px;
+  width: 11px;
+  height: 11px;
   border: 2px solid rgba(255, 255, 255, 0.3);
   border-radius: 50%;
   border-top-color: white;
