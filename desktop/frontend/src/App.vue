@@ -1,5 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { EventsOn } from '../wailsjs/runtime/runtime'
+import { GetStatus, GetTrafficNow, ToggleStealth } from '../wailsjs/go/main/App'
 
 // 状态数据
 const isProtected = ref(false)
@@ -38,15 +40,9 @@ async function handleToggle() {
   statusMessage.value = targetState ? '正在应用系统级加固与防火墙规则...' : '正在恢复系统默认网络设置...'
 
   try {
-    if (window.go && window.go.main && window.go.main.App) {
-      const res = await window.go.main.App.ToggleStealth(targetState)
-      statusMessage.value = res
-      isProtected.value = targetState
-    } else {
-      // 演示模拟环境
-      isProtected.value = targetState
-      statusMessage.value = targetState ? '防护已启动 (演示模式)' : '已恢复默认 (演示模式)'
-    }
+    const res = await ToggleStealth(targetState)
+    statusMessage.value = res || (targetState ? '防护已生效' : '已恢复默认')
+    isProtected.value = targetState
   } catch (err) {
     statusMessage.value = '操作遇到异常: ' + (err?.message || err)
   } finally {
@@ -56,14 +52,12 @@ async function handleToggle() {
 
 // 刷新状态检测
 async function refreshStatus() {
-  if (window.go && window.go.main && window.go.main.App) {
-    try {
-      const res = await window.go.main.App.GetStatus()
-      if (res) {
-        isProtected.value = res.isProtected
-      }
-    } catch {}
-  }
+  try {
+    const res = await GetStatus()
+    if (res) {
+      isProtected.value = res.isProtected
+    }
+  } catch {}
 }
 
 // 接收来自 Go 端的每秒推流数据
@@ -109,30 +103,28 @@ function makeSvgPath(dataArr) {
 onMounted(() => {
   refreshStatus()
 
-  // 监听 Wails 事件
-  if (window.runtime && window.runtime.EventsOn) {
-    window.runtime.EventsOn('traffic-tick', handleTrafficUpdate)
-  } else {
-    // 浏览器独立运行时的动效模拟
-    const timer = setInterval(() => {
-      const mockIn = Math.floor(Math.random() * 80000)
-      const mockOut = Math.floor(Math.random() * 25000)
-      totalIn.value += mockIn
-      totalOut.value += mockOut
-      handleTrafficUpdate({
-        speedIn: mockIn,
-        speedOut: mockOut,
-        totalIn: totalIn.value,
-        totalOut: totalOut.value,
-        activeConns: Math.floor(Math.random() * 5) + 1,
-        logs: [
-          { id: '1', time: new Date().toLocaleTimeString(), host: 'claude.ai:443', method: 'CONNECT', bytesIn: mockIn, bytesOut: mockOut, status: 'Active' },
-          { id: '2', time: new Date().toLocaleTimeString(), host: 'api.anthropic.com:443', method: 'CONNECT', bytesIn: 12040, bytesOut: 1840, status: 'Closed' }
-        ]
-      })
-    }, 1000)
-    onUnmounted(() => clearInterval(timer))
+  // 1. 注册 Wails 事件推流
+  try {
+    EventsOn('traffic-tick', (data) => {
+      handleTrafficUpdate(data)
+    })
+  } catch (e) {
+    console.error('EventsOn error:', e)
   }
+
+  // 2. 双保险：启动 1 秒心跳主动轮询，确保与网关真实吞吐 100% 同步
+  const syncTimer = setInterval(async () => {
+    try {
+      const stats = await GetTrafficNow()
+      if (stats) {
+        handleTrafficUpdate(stats)
+      }
+    } catch (e) {}
+  }, 1000)
+
+  onUnmounted(() => {
+    clearInterval(syncTimer)
+  })
 })
 </script>
 

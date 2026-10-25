@@ -19,6 +19,15 @@ param (
     [string]$ProxyPort = "7897"
 )
 
+# 优先探测本地 8999 安全网关是否运行
+try {
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    if ($tcp.ConnectAsync("127.0.0.1", 8999).Wait(200)) {
+        $ProxyPort = "8999"
+    }
+    $tcp.Close()
+} catch {}
+
 $ErrorActionPreference = "SilentlyContinue"
 $proxyHttp = "http://127.0.0.1:$ProxyPort"
 

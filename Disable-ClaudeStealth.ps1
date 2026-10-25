@@ -159,6 +159,22 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
     git config --global --unset https.proxy
 }
 
+# 6.1 还原 Windows 系统代理 (WinINet)
+$inetKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+if ($snapshot -and $snapshot.OriginalProxyServer) {
+    Set-ItemProperty -Path $inetKey -Name "ProxyServer" -Value $snapshot.OriginalProxyServer -Force
+    Set-ItemProperty -Path $inetKey -Name "ProxyEnable" -Value $snapshot.OriginalProxyEnable -Force
+} else {
+    Set-ItemProperty -Path $inetKey -Name "ProxyServer" -Value "127.0.0.1:7897" -Force
+    Set-ItemProperty -Path $inetKey -Name "ProxyEnable" -Value 1 -Force
+}
+try {
+    $sig = '[DllImport("wininet.dll", SetLastError = true)] public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);'
+    $w = Add-Type -MemberDefinition $sig -Name "WinINetReset" -Namespace "Net" -PassThru -ErrorAction SilentlyContinue
+    $w::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+    $w::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+} catch {}
+
 # 广播系统环境变量变更
 try {
     Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @'

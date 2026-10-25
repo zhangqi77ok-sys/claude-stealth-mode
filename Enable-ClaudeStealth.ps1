@@ -65,12 +65,17 @@ if (-not (Test-Path $snapshotPath)) {
         $v6Adapters = @(Get-NetAdapterBinding -ComponentId ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $true } | Select-Object -ExpandProperty Name)
         $origHttpProxy = [System.Environment]::GetEnvironmentVariable("HTTP_PROXY", "User")
         
+        $inetKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        $inetProps = Get-ItemProperty -Path $inetKey -ErrorAction SilentlyContinue
+
         $snapshot = [PSCustomObject]@{
-            OriginalTimezone   = $curTz
-            OriginalGeoId      = $curGeo
-            OriginalV6Adapters = $v6Adapters
-            OriginalHttpProxy  = $origHttpProxy
-            CreatedTime        = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
+            OriginalTimezone    = $curTz
+            OriginalGeoId       = $curGeo
+            OriginalV6Adapters  = $v6Adapters
+            OriginalHttpProxy   = $origHttpProxy
+            OriginalProxyServer = $inetProps.ProxyServer
+            OriginalProxyEnable = $inetProps.ProxyEnable
+            CreatedTime         = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
         }
         $snapshot | ConvertTo-Json -Depth 5 | Set-Content -Path $snapshotPath -Encoding UTF8
         Write-Host "  ✅ 系统原值快照已安全保存 (.stealth-snapshot.json)" -ForegroundColor Green
@@ -317,7 +322,19 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
     git config --global http.proxy $proxyHttp
     git config --global https.proxy $proxyHttp
 }
-Write-Host "  ✅ 命令行与子进程代理已就绪 (HTTP_PROXY / ALL_PROXY / Git)" -ForegroundColor Green
+
+# 9.1 同时接管 Windows 系统级代理 (WinINet)，确保 Chrome/Edge/Claude 客户端流量全量经由本网关
+$inetKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+Set-ItemProperty -Path $inetKey -Name "ProxyServer" -Value "127.0.0.1:$ProxyPort" -Force
+Set-ItemProperty -Path $inetKey -Name "ProxyEnable" -Value 1 -Force
+try {
+    $sig = '[DllImport("wininet.dll", SetLastError = true)] public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);'
+    $w = Add-Type -MemberDefinition $sig -Name "WinINetPxy" -Namespace "Net" -PassThru -ErrorAction SilentlyContinue
+    $w::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+    $w::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+} catch {}
+
+Write-Host "  ✅ 命令行、系统级与子进程代理已就绪 (WinINet / HTTP_PROXY / ALL_PROXY / Git)" -ForegroundColor Green
 
 # 清理旧的 Claude 桌面端硬件指纹与沙箱残留
 $claudePkgData = "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache"
