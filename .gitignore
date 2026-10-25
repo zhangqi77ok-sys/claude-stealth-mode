@@ -20,7 +20,10 @@ eval_report.json
 01-foundations/15-eval/eval_report.json
 01-foundations/07-tracing/traces/*.json
 
-# 前端
+# 前端与编译产物
 node_modules/
 dist/
+!desktop/frontend/dist/
 *.tsbuildinfo
+desktop/bin/
+
