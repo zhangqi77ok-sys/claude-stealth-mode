@@ -41,19 +41,20 @@ func isClaudeHost(host string) bool {
 		strings.Contains(h, "challenges.cloudflare.com")
 }
 
-// Gateway 统一安全网关与流量监控器
+// Gateway 统一安全网关与流量监控器 (严格 Fail-Closed 防护架构)
 type Gateway struct {
 	listenAddr    string
 	upstreamProxy string
 	server        *http.Server
 	listener      net.Listener
 
-	totalIn   uint64
-	totalOut  uint64
-	claudeIn  uint64
-	claudeOut uint64
-	speedIn   uint64
-	speedOut  uint64
+	totalIn      uint64
+	totalOut     uint64
+	claudeIn     uint64
+	claudeOut    uint64
+	speedIn      uint64
+	speedOut     uint64
+	blockedCount uint64
 
 	lastIn     uint64
 	lastOut    uint64
@@ -92,9 +93,7 @@ func (g *Gateway) Start() error {
 		_ = g.server.Serve(l)
 	}()
 
-	// 启动后台速率计算定时器
 	go g.speedCalculator()
-
 	return nil
 }
 
@@ -117,6 +116,7 @@ func (g *Gateway) ClearLogs() {
 }
 
 func (g *Gateway) triggerRiskAlert(host string, status int, reason string) {
+	atomic.AddUint64(&g.blockedCount, 1)
 	g.logsLock.Lock()
 	defer g.logsLock.Unlock()
 	g.riskAlert = &RiskAlert{
@@ -157,7 +157,6 @@ func (g *Gateway) speedCalculator() {
 			curIn := atomic.LoadUint64(&g.totalIn)
 			curOut := atomic.LoadUint64(&g.totalOut)
 
-			// 每秒计算速率 (Bytes/s)
 			atomic.StoreUint64(&g.speedIn, curIn-g.lastIn)
 			atomic.StoreUint64(&g.speedOut, curOut-g.lastOut)
 
@@ -175,7 +174,7 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleTunnel 处理 HTTPS CONNECT 隧道
+// handleTunnel 处理 HTTPS CONNECT 隧道 (严格 Fail-Closed 防护，严禁公网直连)
 func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt32(&g.activeConn, 1)
 	defer atomic.AddInt32(&g.activeConn, -1)
@@ -193,42 +192,49 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	g.addLog(connLog)
 
-	var upstreamConn net.Conn
-	var err error
-
 	upstreamProxy := g.GetUpstream()
-	// 如果配置了上游代理 (如 127.0.0.1:7897)，则向代理发起 CONNECT 握手
-	if upstreamProxy != "" {
-		u, parseErr := url.Parse(upstreamProxy)
-		if parseErr == nil && u.Host != "" {
-			d := net.Dialer{Timeout: 6 * time.Second}
-			upstreamConn, err = d.Dial("tcp", u.Host)
-			if err == nil {
-				// 向上游代理发送 HTTP CONNECT
-				connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", r.Host, r.Host)
-				_, err = upstreamConn.Write([]byte(connectReq))
-				if err == nil {
-					br := bufio.NewReader(upstreamConn)
-					resp, respErr := http.ReadResponse(br, r)
-					if respErr != nil || resp.StatusCode != http.StatusOK {
-						if resp != nil && (resp.StatusCode == 403 || resp.StatusCode == 429) {
-							g.triggerRiskAlert(r.Host, resp.StatusCode, "上游代理节点返回 403/429 访问拒绝，建议切换干净节点")
-						}
-						upstreamConn.Close()
-						err = fmt.Errorf("upstream proxy error")
-					}
+	// Fail-Closed: 如果未配置上游代理，物理阻断，绝不允许走物理网卡直连泄露国内真实 IP！
+	if upstreamProxy == "" {
+		atomic.AddUint64(&g.blockedCount, 1)
+		connLog.Status = "Blocked (Fail-Closed)"
+		connLog.Duration = time.Since(startTime).Truncate(time.Millisecond).String()
+		http.Error(w, "Fail-Closed: 严禁外网直连，未检测到上游代理", http.StatusBadGateway)
+		return
+	}
+
+	u, parseErr := url.Parse(upstreamProxy)
+	if parseErr != nil || u.Host == "" {
+		atomic.AddUint64(&g.blockedCount, 1)
+		connLog.Status = "Blocked (Invalid Proxy)"
+		connLog.Duration = time.Since(startTime).Truncate(time.Millisecond).String()
+		http.Error(w, "Fail-Closed: 上游代理地址非法", http.StatusBadGateway)
+		return
+	}
+
+	d := net.Dialer{Timeout: 6 * time.Second}
+	upstreamConn, err := d.Dial("tcp", u.Host)
+	if err == nil {
+		// 向上游代理发起 HTTP CONNECT 隧道握手
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", r.Host, r.Host)
+		_, err = upstreamConn.Write([]byte(connectReq))
+		if err == nil {
+			br := bufio.NewReader(upstreamConn)
+			resp, respErr := http.ReadResponse(br, r)
+			if respErr != nil || resp.StatusCode != http.StatusOK {
+				if resp != nil && (resp.StatusCode == 403 || resp.StatusCode == 429) {
+					g.triggerRiskAlert(r.Host, resp.StatusCode, "上游代理节点返回 403/429 访问受限")
 				}
+				upstreamConn.Close()
+				err = fmt.Errorf("upstream proxy error")
 			}
 		}
-	} else {
-		// 直连上游
-		upstreamConn, err = net.DialTimeout("tcp", r.Host, 6*time.Second)
 	}
 
 	if err != nil {
-		connLog.Status = "Blocked"
+		atomic.AddUint64(&g.blockedCount, 1)
+		connLog.Status = "Blocked (Fail-Closed)"
 		connLog.Duration = time.Since(startTime).Truncate(time.Millisecond).String()
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "Fail-Closed: 上游代理异常断开，物理阻断以防真实 IP 泄露", http.StatusServiceUnavailable)
 		return
 	}
 	defer upstreamConn.Close()
@@ -304,7 +310,7 @@ func (g *Gateway) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	connLog.Duration = time.Since(startTime).Truncate(time.Millisecond).String()
 }
 
-// handleForward 处理常规 HTTP 请求 (清洗 Header 并转发)
+// handleForward 处理常规 HTTP 请求 (清洗 Header 并强制通过代理转发)
 func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt32(&g.activeConn, 1)
 	defer atomic.AddInt32(&g.activeConn, -1)
@@ -322,21 +328,36 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	g.addLog(connLog)
 
-	// 自动清洗请求头中的语言特征
-	r.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
 	upstreamProxy := g.GetUpstream()
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+	if upstreamProxy == "" {
+		atomic.AddUint64(&g.blockedCount, 1)
+		connLog.Status = "Blocked (Fail-Closed)"
+		http.Error(w, "Fail-Closed: 严禁外网直连，未检测到上游代理", http.StatusBadGateway)
+		return
 	}
-	if upstreamProxy != "" {
-		if u, err := url.Parse(upstreamProxy); err == nil {
-			transport.Proxy = http.ProxyURL(u)
-		}
+
+	u, parseErr := url.Parse(upstreamProxy)
+	if parseErr != nil || u.Host == "" {
+		atomic.AddUint64(&g.blockedCount, 1)
+		connLog.Status = "Blocked (Invalid Proxy)"
+		http.Error(w, "Fail-Closed: 上游代理地址非法", http.StatusBadGateway)
+		return
+	}
+
+	// 深度剥离中文字符集与内网透传 Header，强行伪装语言环境
+	r.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	r.Header.Del("X-Forwarded-For")
+	r.Header.Del("X-Real-IP")
+	r.Header.Del("Client-IP")
+	r.Header.Del("True-Client-IP")
+
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(u),
 	}
 
 	outReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
 	if err != nil {
+		atomic.AddUint64(&g.blockedCount, 1)
 		connLog.Status = "Blocked"
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -345,6 +366,7 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
+		atomic.AddUint64(&g.blockedCount, 1)
 		connLog.Status = "Blocked"
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -355,7 +377,6 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 		g.triggerRiskAlert(r.URL.Host, resp.StatusCode, "捕获到 Cloudflare 访问挑战/拦截 (403/429/Challenge)")
 	}
 
-	// 拷贝响应头与状态码
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -363,7 +384,6 @@ func (g *Gateway) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	// 流式中继并计数流入数据
 	buf := make([]byte, 16*1024)
 	for {
 		n, rErr := resp.Body.Read(buf)
@@ -407,6 +427,7 @@ func (g *Gateway) GetStats() map[string]interface{} {
 		"totalOut":      atomic.LoadUint64(&g.totalOut),
 		"claudeIn":      atomic.LoadUint64(&g.claudeIn),
 		"claudeOut":     atomic.LoadUint64(&g.claudeOut),
+		"blockedCount":  atomic.LoadUint64(&g.blockedCount),
 		"activeConns":   atomic.LoadInt32(&g.activeConn),
 		"upstreamProxy": g.upstreamProxy,
 		"riskAlert":     g.riskAlert,
