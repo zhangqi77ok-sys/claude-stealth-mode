@@ -13,6 +13,7 @@ __pycache__/
 .workbuddy/
 
 # 运行产物
+.stealth-snapshot.json
 traces/*.json
 eval_report.json
 01-foundations/15-eval/traces/*.json
